@@ -14,6 +14,7 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -460,7 +461,8 @@ def handle_contract_review(handler: PMRequestHandler) -> Dict[str, Any]:
         result["ok"] = True
         return result
     finally:
-        pass  # Temp dir cleanup is handled by the caller's finally or OS reclaim
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB limit
 PDF_SIGNATURE = b"%PDF-"

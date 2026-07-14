@@ -28,3 +28,5 @@ backend/data/
 
 # Temp / pywin32 gen_py cache
 gen_py/
+# Contract review temporary artifacts
+cr_upload_*/

@@ -1,136 +1,213 @@
 /**
- * Contract Review - Three-column review workspace with PDF.js
+ * Contract Review workspace.
+ *
+ * The PDF bytes are only read by PDF.js. Highlights are HTML overlays and are
+ * never written back into the source files.
  */
-
-(function() {
+(function () {
     "use strict";
 
-    // ========================================================================
-    // PDFViewer - single PDF viewer panel
-    // ========================================================================
-    function PDFViewer(containerEl, panelId) {
-        this.container = containerEl;
-        this.panelId = panelId;  // "left" or "mid"
+    var CATEGORY_ORDER = ["customer_information", "product_information", "other_information"];
+    var CATEGORY_FALLBACK = {
+        customer_information: "客户信息",
+        product_information: "产品信息",
+        other_information: "其他信息"
+    };
+
+    function escapeHtml(value) {
+        return String(value == null ? "" : value)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#39;");
+    }
+
+    function statusKind(node) {
+        var status = String(node.status || "").toUpperCase();
+        var severity = String(node.severity || "").toLowerCase();
+        if (severity === "blocker" || status === "BLOCKER" || status === "MISMATCH") return "blocker";
+        if (severity === "warning" || status === "WARNING" || status === "UNDETERMINED") return "warning";
+        if (status === "PASS") return "pass";
+        return "info";
+    }
+
+    function statusLabel(node) {
+        var status = String(node.status || "").toUpperCase();
+        if (status === "MISMATCH") return "不一致";
+        if (status === "UNDETERMINED") return "待确认";
+        if (status === "PASS") return "通过";
+        if (status === "WARNING") return "警告";
+        if (status === "BLOCKER") return "阻断";
+        return status || "信息";
+    }
+
+    function uniqueEvidence(entries) {
+        var seen = {};
+        return (entries || []).filter(function (entry) {
+            if (!entry) return false;
+            var key = [entry.document_type, entry.page, entry.label, entry.quote].join("|");
+            if (seen[key]) return false;
+            seen[key] = true;
+            return true;
+        });
+    }
+
+    // ---------------------------------------------------------------------
+    // PDF viewer
+    // ---------------------------------------------------------------------
+
+    function PDFViewer(container, panelId) {
+        this.container = container;
+        this.panelId = panelId;
         this.pdfDoc = null;
-        this.currentPage = 1;
-        this.totalPages = 0;
-        this.scale = 1.2;
-        this.defaultScale = 1.2;
+        this.loadingTask = null;
         this.renderTask = null;
+        this.loadSerial = 0;
+        this.renderSerial = 0;
         this.objectURL = null;
         this.fileName = "";
-        this.documentType = ""; // "contract", "cqp", "ta"
-        this.highlights = [];  // list of {rects, class} for current page
-        this.pageRendering = false;
-        this.pendingPageNum = null;
+        this.documentType = "";
+        this.currentPage = 1;
+        this.totalPages = 0;
+        this.scale = 1.15;
+        this.defaultScale = 1.15;
+        this.highlights = [];
+        this.targetEvidence = null;
+        this.readyPromise = Promise.resolve();
         this._init();
     }
 
-    PDFViewer.prototype._init = function() {
+    PDFViewer.prototype._init = function () {
         var self = this;
-        var c = this.container;
+        this.container.innerHTML =
+            '<div class="cr-pdf-toolbar">' +
+                '<div class="cr-pdf-identity">' +
+                    '<span class="cr-pdf-doc-label" data-role="doc-label">PDF</span>' +
+                    '<span class="cr-pdf-filename" data-role="filename"></span>' +
+                '</div>' +
+                '<div class="cr-pdf-controls">' +
+                    '<button class="cr-pdf-btn" data-action="prev" type="button" aria-label="上一页">‹</button>' +
+                    '<input class="cr-pdf-page-input" data-action="page-input" type="text" inputmode="numeric" value="1" aria-label="页码">' +
+                    '<span class="cr-pdf-page-info" data-role="page-info">/ 0</span>' +
+                    '<button class="cr-pdf-btn" data-action="next" type="button" aria-label="下一页">›</button>' +
+                    '<button class="cr-pdf-btn" data-action="zoomout" type="button" aria-label="缩小">−</button>' +
+                    '<button class="cr-pdf-btn" data-action="zoomin" type="button" aria-label="放大">＋</button>' +
+                    '<button class="cr-pdf-btn cr-pdf-btn--text" data-action="fitwidth" type="button">适宽</button>' +
+                    '<button class="cr-pdf-btn cr-pdf-btn--text" data-action="resetzoom" type="button">100%</button>' +
+                '</div>' +
+            '</div>' +
+            '<div class="cr-pdf-location" data-role="location" hidden></div>' +
+            '<div class="cr-pdf-viewer-container" data-role="viewer-container">' +
+                '<div class="cr-placeholder">请上传 PDF 文件</div>' +
+            '</div>';
 
-        c.innerHTML = '<div class="cr-pdf-toolbar">' +
-            '<span class="cr-pdf-doc-label" data-role="doc-label">' + (this.panelId === 'left' ? '左侧查看器' : '中间查看器') + '</span>' +
-            '<span class="cr-pdf-filename" data-role="filename"></span>' +
-            '<button class="cr-pdf-btn" data-action="prev" title="上一页"><</button>' +
-            '<input class="cr-pdf-page-input" data-action="page-input" type="text" value="1" size="3">' +
-            '<span class="cr-pdf-page-info" data-role="page-info">/ 0</span>' +
-            '<button class="cr-pdf-btn" data-action="next" title="下一页">></button>' +
-            '<button class="cr-pdf-btn" data-action="zoomin" title="放大">+</button>' +
-            '<button class="cr-pdf-btn" data-action="zoomout" title="缩小">-</button>' +
-            '<button class="cr-pdf-btn" data-action="fitwidth" title="适合宽度">[]</button>' +
-            '<button class="cr-pdf-btn" data-action="resetzoom" title="默认缩放">1:1</button>' +
-        '</div>' +
-        '<div class="cr-pdf-viewer-container" data-role="viewer-container">' +
-            '<div class="cr-placeholder">请上传 PDF 文件</div>' +
-        '</div>';
+        this.docLabel = this.container.querySelector('[data-role="doc-label"]');
+        this.fileNameEl = this.container.querySelector('[data-role="filename"]');
+        this.pageInput = this.container.querySelector('[data-action="page-input"]');
+        this.pageInfo = this.container.querySelector('[data-role="page-info"]');
+        this.locationEl = this.container.querySelector('[data-role="location"]');
+        this.viewerContainer = this.container.querySelector('[data-role="viewer-container"]');
 
-        this.docLabel = c.querySelector('[data-role="doc-label"]');
-        this.filenameEl = c.querySelector('[data-role="filename"]');
-        this.pageInput = c.querySelector('[data-action="page-input"]');
-        this.pageInfo = c.querySelector('[data-role="page-info"]');
-        this.viewerContainer = c.querySelector('[data-role="viewer-container"]');
-        this.prevBtn = c.querySelector('[data-action="prev"]');
-        this.nextBtn = c.querySelector('[data-action="next"]');
-
-        // Event binding
-        c.querySelector('[data-action="prev"]').addEventListener('click', function() { self.prevPage(); });
-        c.querySelector('[data-action="next"]').addEventListener('click', function() { self.nextPage(); });
-        c.querySelector('[data-action="zoomin"]').addEventListener('click', function() { self.zoomIn(); });
-        c.querySelector('[data-action="zoomout"]').addEventListener('click', function() { self.zoomOut(); });
-        c.querySelector('[data-action="fitwidth"]').addEventListener('click', function() { self.fitWidth(); });
-        c.querySelector('[data-action="resetzoom"]').addEventListener('click', function() { self.resetZoom(); });
-
-        this.pageInput.addEventListener('keydown', function(e) {
-            if (e.key === 'Enter') {
-                var num = parseInt(self.pageInput.value, 10);
-                if (num >= 1 && num <= self.totalPages) {
-                    self.goToPage(num);
-                } else {
-                    self.pageInput.value = String(self.currentPage);
-                }
-            }
+        this.container.querySelector('[data-action="prev"]').addEventListener("click", function () {
+            self.goToPage(self.currentPage - 1);
         });
-
-        // Track scroll to maintain center when zooming
-        this.viewerContainer.addEventListener('scroll', function() {
-            self._lastScrollTop = self.viewerContainer.scrollTop;
+        this.container.querySelector('[data-action="next"]').addEventListener("click", function () {
+            self.goToPage(self.currentPage + 1);
+        });
+        this.container.querySelector('[data-action="zoomin"]').addEventListener("click", function () {
+            self.scale = Math.min(3, self.scale + 0.15);
+            self.renderPage(self.currentPage);
+        });
+        this.container.querySelector('[data-action="zoomout"]').addEventListener("click", function () {
+            self.scale = Math.max(0.45, self.scale - 0.15);
+            self.renderPage(self.currentPage);
+        });
+        this.container.querySelector('[data-action="resetzoom"]').addEventListener("click", function () {
+            self.scale = self.defaultScale;
+            self.renderPage(self.currentPage);
+        });
+        this.container.querySelector('[data-action="fitwidth"]').addEventListener("click", function () {
+            self.fitWidth();
+        });
+        this.pageInput.addEventListener("keydown", function (event) {
+            if (event.key !== "Enter") return;
+            var page = parseInt(self.pageInput.value, 10);
+            if (!Number.isFinite(page)) page = self.currentPage;
+            self.goToPage(page);
         });
     };
 
-    PDFViewer.prototype.loadPDF = function(file, fileRole) {
-        var self = this;
-        // Clean up previous
-        this.release();
-
-        this.fileName = file.name || "";
-        this.documentType = fileRole || "";
-        if (this.docLabel) {
-            this.docLabel.textContent = (fileRole || "File").toUpperCase();
+    PDFViewer.prototype._setLocationMessage = function (message) {
+        if (!message) {
+            this.locationEl.hidden = true;
+            this.locationEl.textContent = "";
+            return;
         }
-        if (this.filenameEl) {
-            this.filenameEl.textContent = this.fileName;
+        this.locationEl.hidden = false;
+        this.locationEl.textContent = message;
+    };
+
+    PDFViewer.prototype.loadPDF = function (file, documentType) {
+        var self = this;
+        var serial = ++this.loadSerial;
+        this._releaseDocument();
+        this.documentType = documentType || "";
+        this.fileName = file ? file.name : "";
+        this.docLabel.textContent = documentType === "contract" ? "合同" : documentType === "cqp" ? "CQP" : documentType === "ta" ? "TA" : "PDF";
+        this.fileNameEl.textContent = this.fileName;
+        this.clearHighlights();
+        this._setLocationMessage("");
+        this.viewerContainer.innerHTML = '<div class="cr-placeholder">PDF 加载中...</div>';
+
+        if (!file || typeof pdfjsLib === "undefined") {
+            this.viewerContainer.innerHTML = '<div class="cr-placeholder">PDF.js 未加载或文件不可用</div>';
+            this.readyPromise = Promise.reject(new Error("PDF.js 未加载或文件不可用"));
+            return this.readyPromise;
         }
 
         this.objectURL = URL.createObjectURL(file);
-
-        var loadingTask = pdfjsLib.getDocument({ url: this.objectURL });
-        loadingTask.promise.then(function(pdfDoc) {
-            self.pdfDoc = pdfDoc;
-            self.totalPages = pdfDoc.numPages;
-            self.pageInfo.textContent = "/ " + self.totalPages;
-            self.currentPage = 1;
-            self.pageInput.value = "1";
-            self.renderPage(1);
-        }).catch(function(err) {
-            console.error("PDF load error:", err);
-            self.viewerContainer.innerHTML = '<div class="cr-placeholder">PDF 加载失败: ' + self._escape(err.message) + '</div>';
+        this.loadingTask = pdfjsLib.getDocument({
+            url: this.objectURL,
+            cMapUrl: "vendor/pdfjs/web/cmaps/",
+            cMapPacked: true
         });
+        this.readyPromise = this.loadingTask.promise.then(function (doc) {
+            if (serial !== self.loadSerial) {
+                try { doc.destroy(); } catch (ignore) {}
+                throw new Error("PDF load superseded");
+            }
+            self.pdfDoc = doc;
+            self.totalPages = doc.numPages;
+            self.currentPage = 1;
+            self.pageInfo.textContent = "/ " + self.totalPages;
+            self.pageInput.value = "1";
+            return self.renderPage(1);
+        }).catch(function (error) {
+            if (serial === self.loadSerial) {
+                self.viewerContainer.innerHTML = '<div class="cr-placeholder">PDF 加载失败：' + escapeHtml(error && error.message) + '</div>';
+            }
+            throw error;
+        });
+        return this.readyPromise;
     };
 
-    PDFViewer.prototype._escape = function(str) {
-        return String(str || "").replace(/&/g, "&").replace(/</g, "<").replace(/>/g, ">");
-    };
-
-    PDFViewer.prototype.renderPage = function(pageNum) {
+    PDFViewer.prototype.renderPage = function (pageNumber) {
         var self = this;
-        if (!this.pdfDoc) return;
-
-        // Cancel any pending render
+        if (!this.pdfDoc) return Promise.resolve();
+        pageNumber = Math.max(1, Math.min(this.totalPages, Number(pageNumber) || 1));
+        var serial = ++this.renderSerial;
         if (this.renderTask) {
-            this.renderTask.cancel();
+            try { this.renderTask.cancel(); } catch (ignore) {}
             this.renderTask = null;
         }
+        this.currentPage = pageNumber;
+        this.pageInput.value = String(pageNumber);
 
-        this.currentPage = pageNum;
-        this.pageInput.value = String(pageNum);
-        this.pageRendering = true;
-
-        this.pdfDoc.getPage(pageNum).then(function(page) {
+        return this.pdfDoc.getPage(pageNumber).then(function (page) {
+            if (serial !== self.renderSerial) return;
             var viewport = page.getViewport({ scale: self.scale });
-
-            // Create canvas
+            var pixelRatio = window.devicePixelRatio || 1;
             var wrapper = document.createElement("div");
             wrapper.className = "cr-pdf-page-wrapper";
             wrapper.style.width = viewport.width + "px";
@@ -138,697 +215,558 @@
 
             var canvas = document.createElement("canvas");
             canvas.className = "cr-pdf-canvas";
-            canvas.width = viewport.width;
-            canvas.height = viewport.height;
+            canvas.width = Math.floor(viewport.width * pixelRatio);
+            canvas.height = Math.floor(viewport.height * pixelRatio);
+            canvas.style.width = viewport.width + "px";
+            canvas.style.height = viewport.height + "px";
             wrapper.appendChild(canvas);
 
-            // Text layer (simplified)
-            var textLayerDiv = document.createElement("div");
-            textLayerDiv.className = "cr-pdf-text-layer";
-            textLayerDiv.style.width = viewport.width + "px";
-            textLayerDiv.style.height = viewport.height + "px";
-            wrapper.appendChild(textLayerDiv);
+            var textLayer = document.createElement("div");
+            textLayer.className = "cr-pdf-text-layer";
+            textLayer.style.width = viewport.width + "px";
+            textLayer.style.height = viewport.height + "px";
+            wrapper.appendChild(textLayer);
 
-            // Highlight overlay
-            var highlightOverlay = document.createElement("div");
-            highlightOverlay.className = "cr-highlight-overlay";
-            highlightOverlay.setAttribute("data-role", "highlight-overlay");
-            highlightOverlay.style.width = viewport.width + "px";
-            highlightOverlay.style.height = viewport.height + "px";
-            wrapper.appendChild(highlightOverlay);
+            var overlay = document.createElement("div");
+            overlay.className = "cr-highlight-overlay";
+            overlay.style.width = viewport.width + "px";
+            overlay.style.height = viewport.height + "px";
+            wrapper.appendChild(overlay);
 
             self.viewerContainer.innerHTML = "";
             self.viewerContainer.appendChild(wrapper);
-
-            // Render canvas
-            var ctx = canvas.getContext("2d");
-            var renderContext = { canvasContext: ctx, viewport: viewport };
-
-            self.renderTask = page.render(renderContext);
-            self.renderTask.promise.then(function() {
-                self.renderTask = null;
-                self.pageRendering = false;
-
-                // Render text layer
-                page.getTextContent().then(function(textContent) {
-                    pdfjsLib.renderTextLayer({
-                        textContent: textContent,
-                        container: textLayerDiv,
-                        viewport: viewport,
-                        textDivs: [],
-                    });
-                    // Draw highlights after text layer is ready
-                    self._drawHighlights(viewport);
-                });
-
-                // Process pending page request
-                if (self.pendingPageNum && self.pendingPageNum !== pageNum) {
-                    var p = self.pendingPageNum;
-                    self.pendingPageNum = null;
-                    self.renderPage(p);
-                }
-
-                // Scroll to center if evidence navigation happened
-                if (self._targetScrollCenter) {
-                    var container = self.viewerContainer;
-                    var target = self._targetScrollCenter;
-                    container.scrollTop = Math.max(0, target - container.clientHeight / 3);
-                    self._targetScrollCenter = null;
-                }
-            }).catch(function(err) {
-                if (err && err.name === "RenderingCancelledException") {
-                    // Expected when switching pages quickly
-                    return;
-                }
-                self.renderTask = null;
-                self.pageRendering = false;
+            var context = canvas.getContext("2d");
+            self.renderTask = page.render({
+                canvasContext: context,
+                viewport: viewport,
+                transform: pixelRatio === 1 ? null : [pixelRatio, 0, 0, pixelRatio, 0, 0]
             });
-        }).catch(function(err) {
-            console.error("Page render error:", err);
-            self.pageRendering = false;
+            return self.renderTask.promise.then(function () {
+                if (serial !== self.renderSerial) return;
+                self.renderTask = null;
+                self._drawHighlights(viewport, overlay, wrapper);
+                return page.getTextContent().then(function (textContent) {
+                    if (serial !== self.renderSerial || !pdfjsLib.renderTextLayer) return;
+                    try {
+                        var task = pdfjsLib.renderTextLayer({
+                            textContentSource: textContent,
+                            textContent: textContent,
+                            container: textLayer,
+                            viewport: viewport,
+                            textDivs: []
+                        });
+                        return task && task.promise ? task.promise.catch(function () {}) : undefined;
+                    } catch (ignore) {}
+                });
+            }).catch(function (error) {
+                if (!error || error.name !== "RenderingCancelledException") throw error;
+            });
+        }).catch(function (error) {
+            if (!error || error.name !== "RenderingCancelledException") {
+                console.error("PDF page render failed", error);
+            }
         });
     };
 
-    PDFViewer.prototype.goToPage = function(pageNum) {
-        if (!this.pdfDoc) return;
-        if (pageNum < 1) pageNum = 1;
-        if (pageNum > this.totalPages) pageNum = this.totalPages;
-        if (this.pageRendering) {
-            this.pendingPageNum = pageNum;
-            return;
-        }
-        this.renderPage(pageNum);
-    };
-
-    PDFViewer.prototype.prevPage = function() {
-        this.goToPage(this.currentPage - 1);
-    };
-
-    PDFViewer.prototype.nextPage = function() {
-        this.goToPage(this.currentPage + 1);
-    };
-
-    PDFViewer.prototype.zoomIn = function() {
-        this.scale = Math.min(3.0, this.scale + 0.2);
-        this.renderPage(this.currentPage);
-    };
-
-    PDFViewer.prototype.zoomOut = function() {
-        this.scale = Math.max(0.4, this.scale - 0.2);
-        this.renderPage(this.currentPage);
-    };
-
-    PDFViewer.prototype.fitWidth = function() {
-        var containerWidth = this.viewerContainer.clientWidth - 24;
-        if (!this.pdfDoc || containerWidth <= 0) return;
+    PDFViewer.prototype._drawHighlights = function (viewport, overlay, wrapper) {
         var self = this;
-        this.pdfDoc.getPage(this.currentPage).then(function(page) {
-            var vp = page.getViewport({ scale: 1 });
-            self.scale = Math.max(0.4, containerWidth / vp.width);
-            self.renderPage(self.currentPage);
-        }).catch(function() {});
+        var firstTop = null;
+        this.highlights.forEach(function (highlight) {
+            var evidence = highlight.evidence || {};
+            if (Number(evidence.page) !== self.currentPage) return;
+            var pageWidth = Number(evidence.page_width) || (viewport.width / self.scale);
+            var pageHeight = Number(evidence.page_height) || (viewport.height / self.scale);
+            var scaleX = viewport.width / pageWidth;
+            var scaleY = viewport.height / pageHeight;
+            (evidence.rects || []).forEach(function (rect) {
+                if (!Array.isArray(rect) || rect.length !== 4) return;
+                var left = Number(rect[0]) * scaleX;
+                var top = Number(rect[1]) * scaleY;
+                var width = Math.max(2, (Number(rect[2]) - Number(rect[0])) * scaleX);
+                var height = Math.max(4, (Number(rect[3]) - Number(rect[1])) * scaleY);
+                var marker = document.createElement("div");
+                marker.className = "cr-highlight-rect " + (highlight.className || "") + " pulse";
+                marker.style.left = left + "px";
+                marker.style.top = top + "px";
+                marker.style.width = width + "px";
+                marker.style.height = height + "px";
+                overlay.appendChild(marker);
+                if (firstTop === null || top < firstTop) firstTop = top;
+            });
+        });
+        if (firstTop !== null) {
+            window.requestAnimationFrame(function () {
+                self.viewerContainer.scrollTop = Math.max(0, wrapper.offsetTop + firstTop - self.viewerContainer.clientHeight / 3);
+            });
+        }
     };
 
-    PDFViewer.prototype.resetZoom = function() {
-        this.scale = this.defaultScale;
-        this.renderPage(this.currentPage);
+    PDFViewer.prototype.goToPage = function (pageNumber) {
+        if (!this.pdfDoc) return this.readyPromise || Promise.resolve();
+        pageNumber = Math.max(1, Math.min(this.totalPages, Number(pageNumber) || 1));
+        return this.renderPage(pageNumber);
     };
 
-    // ---- Highlights ----
+    PDFViewer.prototype.fitWidth = function () {
+        var self = this;
+        if (!this.pdfDoc) return Promise.resolve();
+        return this.pdfDoc.getPage(this.currentPage).then(function (page) {
+            var base = page.getViewport({ scale: 1 });
+            var available = Math.max(200, self.viewerContainer.clientWidth - 28);
+            self.scale = Math.max(0.45, Math.min(3, available / base.width));
+            return self.renderPage(self.currentPage);
+        });
+    };
 
-    PDFViewer.prototype.clearHighlights = function() {
+    PDFViewer.prototype.navigateToEvidence = function (entries, className) {
+        var self = this;
+        var relevant = uniqueEvidence(entries).filter(function (entry) {
+            return entry.document_type === self.documentType;
+        });
+        this.highlights = relevant.map(function (evidence) {
+            return { evidence: evidence, className: className };
+        });
+        var target = relevant.find(function (entry) { return Number(entry.page) > 0; });
+        if (!target) {
+            this._setLocationMessage("无法确定位置");
+            return Promise.resolve(false);
+        }
+        var exact = target.location_status === "exact" && Array.isArray(target.rects) && target.rects.length > 0;
+        this._setLocationMessage(exact ? "" : "无法确定位置");
+        return this.goToPage(Number(target.page)).then(function () { return exact; });
+    };
+
+    PDFViewer.prototype.clearHighlights = function () {
         this.highlights = [];
-        var overlay = this.container.querySelector('[data-role="highlight-overlay"]');
+        this.targetEvidence = null;
+        this._setLocationMessage("");
+        var overlay = this.container.querySelector(".cr-highlight-overlay");
         if (overlay) overlay.innerHTML = "";
     };
 
-    PDFViewer.prototype.setHighlights = function(highlightRects, highlightClass) {
-        this.highlights = (highlightRects || []).map(function(r) {
-            return { rects: r, cls: highlightClass || "cr-highlight-rect--left" };
-        });
-        this._drawHighlights(null);
-    };
-
-    PDFViewer.prototype._drawHighlights = function(viewport) {
-        var overlay = this.container.querySelector('[data-role="highlight-overlay"]');
-        if (!overlay) return;
-        overlay.innerHTML = "";
-
-        if (!this.highlights || this.highlights.length === 0) return;
-
-        var self = this;
-        var hasPulse = false;
-
-        this.highlights.forEach(function(hl) {
-            if (!hl.rects) return;
-            hl.rects.forEach(function(rect) {
-                if (!rect || rect.length < 4) return;
-                var el = document.createElement("div");
-                el.className = "cr-highlight-rect " + (hl.cls || "cr-highlight-rect--left");
-                // rect is [x0, y0, x1, y1] in PDF points
-                // Need to convert to current viewport scale
-                var scale = self.scale;
-                el.style.left = (rect[0] * scale) + "px";
-                el.style.top = (rect[1] * scale) + "px";
-                el.style.width = ((rect[2] - rect[0]) * scale) + "px";
-                el.style.height = ((rect[3] - rect[1]) * scale) + "px";
-                overlay.appendChild(el);
-                hasPulse = true;
-            });
-        });
-
-        // Pulse animation for newly set highlights
-        if (hasPulse && this._doPulse !== false) {
-            var rects = overlay.querySelectorAll('.cr-highlight-rect');
-            rects.forEach(function(r) { r.classList.add("pulse"); });
-            this._doPulse = false;
-        }
-    };
-
-    PDFViewer.prototype.navigateToEvidence = function(evidenceList, highlightClass) {
-        // evidenceList: [{ document_type, page, rects }]
-        var found = false;
-        for (var i = 0; i < evidenceList.length; i++) {
-            var ev = evidenceList[i];
-            if (ev.document_type === this.documentType && ev.page > 0) {
-                this.clearHighlights();
-                if (ev.rects && ev.rects.length > 0) {
-                    this.setHighlights(ev.rects, highlightClass || "cr-highlight-rect--left");
-                }
-                this._doPulse = true;
-                this.goToPage(ev.page);
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            this.clearHighlights();
-        }
-    };
-
-    PDFViewer.prototype.release = function() {
+    PDFViewer.prototype._releaseDocument = function () {
+        ++this.renderSerial;
         if (this.renderTask) {
-            this.renderTask.cancel();
+            try { this.renderTask.cancel(); } catch (ignore) {}
             this.renderTask = null;
         }
+        if (this.loadingTask && this.loadingTask.destroy) {
+            try { this.loadingTask.destroy(); } catch (ignore2) {}
+        }
+        this.loadingTask = null;
+        if (this.pdfDoc && this.pdfDoc.destroy) {
+            try { this.pdfDoc.destroy(); } catch (ignore3) {}
+        }
+        this.pdfDoc = null;
         if (this.objectURL) {
             URL.revokeObjectURL(this.objectURL);
             this.objectURL = null;
         }
-        this.pdfDoc = null;
+    };
+
+    PDFViewer.prototype.release = function () {
+        ++this.loadSerial;
+        this._releaseDocument();
+        this.documentType = "";
+        this.fileName = "";
         this.totalPages = 0;
         this.currentPage = 1;
         this.highlights = [];
-        this.viewerContainer.innerHTML = '<div class="cr-placeholder">请上传 PDF 文件</div>';
         this.pageInfo.textContent = "/ 0";
         this.pageInput.value = "1";
+        this.viewerContainer.innerHTML = '<div class="cr-placeholder">请上传 PDF 文件</div>';
+        this._setLocationMessage("");
     };
 
-    // ========================================================================
-    // ContractReview - Main controller
-    // ========================================================================
+    // ---------------------------------------------------------------------
+    // Review controller
+    // ---------------------------------------------------------------------
 
     function ContractReview() {
         this.selectedFiles = { contract: null, cqp: null, ta: null };
         this.fileObjects = { contract: null, cqp: null, ta: null };
         this.reviewResult = null;
-        this.currentFilter = "needs_check"; // "needs_check", "blocker", "warning", "all", "pass"
-        this.selectedItemId = null;
-        this.status = "idle"; // "idle", "running", "done", "error"
-
-        this.leftViewer = null;
-        this.midViewer = null;
-
-        // PDF.js worker path
+        this.currentFilter = "needs_check";
+        this.selectedKey = "";
+        this.status = "idle";
+        this.categoryOpen = {
+            customer_information: false,
+            product_information: false,
+            other_information: false
+        };
         if (typeof pdfjsLib !== "undefined") {
             pdfjsLib.GlobalWorkerOptions.workerSrc = "vendor/pdfjs/build/pdf.worker.js";
         }
-
         this._init();
     }
 
-    ContractReview.prototype._init = function() {
+    ContractReview.prototype._init = function () {
         var self = this;
-
-        // Build UI inside contractReviewContent
         var container = document.getElementById("contractReviewContent");
         if (!container) return;
-        container.innerHTML = "";
-
-        var html = '<div class="cr-page">' +
-            // Toolbar
-            '<div class="cr-toolbar">' +
-                '<div class="cr-toolbar__files">' +
-                    '<div class="cr-file-slot" data-slot="contract">' +
-                        '<span class="cr-file-slot__label">Contract</span>' +
-                        '<span class="cr-file-slot__name" data-name="contract">未选择</span>' +
-                        '<input type="file" accept=".pdf" class="cr-file-input-hidden" data-input="contract">' +
+        container.innerHTML =
+            '<div class="cr-page">' +
+                '<div class="cr-toolbar">' +
+                    '<div class="cr-toolbar__files">' +
+                        this._fileSlotHtml("contract", "Contract", "未选择") +
+                        this._fileSlotHtml("cqp", "CQP", "未选择") +
+                        this._fileSlotHtml("ta", "TA", "未选择（可选）") +
                     '</div>' +
-                    '<div class="cr-file-slot" data-slot="cqp">' +
-                        '<span class="cr-file-slot__label">CQP</span>' +
-                        '<span class="cr-file-slot__name" data-name="cqp">未选择</span>' +
-                        '<input type="file" accept=".pdf" class="cr-file-input-hidden" data-input="cqp">' +
-                    '</div>' +
-                    '<div class="cr-file-slot" data-slot="ta">' +
-                        '<span class="cr-file-slot__label">TA</span>' +
-                        '<span class="cr-file-slot__name" data-name="ta">未选择(可选)</span>' +
-                        '<input type="file" accept=".pdf" class="cr-file-input-hidden" data-input="ta">' +
+                    '<div class="cr-toolbar__actions">' +
+                        '<span class="cr-status-text"><span class="cr-status-dot cr-status-dot--idle" data-role="status-dot"></span><span data-role="status-text">就绪</span></span>' +
+                        '<button class="btn btn--primary" id="crBtnRun" type="button" disabled>运行测试</button>' +
                     '</div>' +
                 '</div>' +
-                '<div class="cr-toolbar__actions">' +
-                    '<span class="cr-status-text"><span class="cr-status-dot cr-status-dot--idle" data-role="status-dot"></span><span data-role="status-text">就绪</span></span>' +
-                    '<button class="btn btn--primary" id="crBtnRun" disabled>运行测试</button>' +
+                '<div class="cr-workspace">' +
+                    '<section class="cr-pdf-panel" id="crLeftPanel" aria-label="左侧PDF查看器"></section>' +
+                    '<section class="cr-pdf-panel" id="crMidPanel" aria-label="中间PDF查看器"></section>' +
+                    '<aside class="cr-results-panel" id="crResultsPanel">' +
+                        '<div class="cr-results-header"><div class="cr-results-title">检查结果</div><div class="cr-summary-stats" data-role="summary-stats"></div></div>' +
+                        '<div class="cr-filter-bar" data-role="filter-bar">' +
+                            '<button class="cr-filter-btn active" data-filter="needs_check" type="button">需要检查</button>' +
+                            '<button class="cr-filter-btn" data-filter="blocker" type="button">阻断</button>' +
+                            '<button class="cr-filter-btn" data-filter="warning" type="button">警告</button>' +
+                            '<button class="cr-filter-btn" data-filter="all" type="button">全部</button>' +
+                            '<button class="cr-filter-btn" data-filter="pass" type="button">已通过</button>' +
+                        '</div>' +
+                        '<div class="cr-ai-notice" data-role="ai-notice" hidden></div>' +
+                        '<div class="cr-results-list" data-role="results-list"><div class="cr-placeholder">请上传 Contract 和 CQP 后运行测试</div></div>' +
+                    '</aside>' +
                 '</div>' +
-            '</div>' +
-            // Workspace
-            '<div class="cr-workspace">' +
-                '<div class="cr-pdf-panel" id="crLeftPanel"></div>' +
-                '<div class="cr-pdf-panel" id="crMidPanel"></div>' +
-                '<div class="cr-results-panel" id="crResultsPanel">' +
-                    '<div class="cr-results-header">' +
-                        '<div class="cr-results-title">检查结果</div>' +
-                        '<div class="cr-summary-stats" data-role="summary-stats"></div>' +
-                    '</div>' +
-                    '<div class="cr-filter-bar" data-role="filter-bar">' +
-                        '<button class="cr-filter-btn active" data-filter="needs_check">需要检查</button>' +
-                        '<button class="cr-filter-btn" data-filter="blocker">Blocker</button>' +
-                        '<button class="cr-filter-btn" data-filter="warning">Warning</button>' +
-                        '<button class="cr-filter-btn" data-filter="all">全部</button>' +
-                        '<button class="cr-filter-btn" data-filter="pass">已通过</button>' +
-                    '</div>' +
-                    '<div class="cr-results-list" data-role="results-list">' +
-                        '<div class="cr-placeholder">请上传 Contract 和 CQP 文件后运行测试</div>' +
-                    '</div>' +
-                    '<div class="cr-ai-notice" data-role="ai-notice" hidden></div>' +
-                '</div>' +
-            '</div>' +
-        '</div>';
+            '</div>';
 
-        container.innerHTML = html;
-
-        // Create PDF viewers
+        this.container = container;
         this.leftViewer = new PDFViewer(document.getElementById("crLeftPanel"), "left");
         this.midViewer = new PDFViewer(document.getElementById("crMidPanel"), "mid");
 
-        // Bind file slots
-        document.querySelectorAll(".cr-file-slot").forEach(function(slot) {
-            slot.addEventListener("click", function() {
-                var input = slot.querySelector(".cr-file-input-hidden");
-                if (input) input.click();
-            });
-        });
-
-        // Bind file inputs
-        var fileInputs = ["contract", "cqp", "ta"];
-        fileInputs.forEach(function(role) {
-            var input = container.querySelector('[data-input="' + role + '"]');
-            var nameEl = container.querySelector('[data-name="' + role + '"]');
+        ["contract", "cqp", "ta"].forEach(function (role) {
             var slot = container.querySelector('[data-slot="' + role + '"]');
-            if (!input || !nameEl) return;
-
-            input.addEventListener("change", function() {
-                var file = input.files[0];
-                if (file) {
-                    self.selectedFiles[role] = file;
-                    nameEl.textContent = file.name;
-                    if (slot) slot.classList.add("has-file");
-                    // Show PDF immediately
-                    self._displayFile(role, file);
-                    // Clear old results
-                    self._clearResults();
-                } else {
-                    self.selectedFiles[role] = null;
-                    nameEl.textContent = role === "ta" ? "未选择(可选)" : "未选择";
-                    if (slot) slot.classList.remove("has-file");
-                }
-                self._updateRunButton();
+            var input = container.querySelector('[data-input="' + role + '"]');
+            slot.addEventListener("click", function (event) {
+                if (event.target !== input) input.click();
+            });
+            input.addEventListener("click", function (event) { event.stopPropagation(); });
+            input.addEventListener("change", function () {
+                self._onFileChange(role, input.files && input.files[0] ? input.files[0] : null);
             });
         });
 
-        // Run button
-        var runBtn = document.getElementById("crBtnRun");
-        if (runBtn) {
-            runBtn.addEventListener("click", function() {
-                self._runReview();
-            });
-        }
-
-        // Filter buttons
-        var filterBar = container.querySelector('[data-role="filter-bar"]');
-        if (filterBar) {
-            filterBar.addEventListener("click", function(e) {
-                var btn = e.target.closest(".cr-filter-btn");
-                if (!btn) return;
-                filterBar.querySelectorAll(".cr-filter-btn").forEach(function(b) { b.classList.remove("active"); });
-                btn.classList.add("active");
-                self.currentFilter = btn.getAttribute("data-filter") || "needs_check";
+        document.getElementById("crBtnRun").addEventListener("click", function () { self._runReview(); });
+        container.querySelector('[data-role="filter-bar"]').addEventListener("click", function (event) {
+            var button = event.target.closest(".cr-filter-btn");
+            if (!button) return;
+            self.currentFilter = button.getAttribute("data-filter") || "needs_check";
+            container.querySelectorAll(".cr-filter-btn").forEach(function (entry) { entry.classList.remove("active"); });
+            button.classList.add("active");
+            self._renderResults();
+        });
+        container.querySelector('[data-role="results-list"]').addEventListener("click", function (event) {
+            var category = event.target.closest("[data-category-toggle]");
+            if (category) {
+                var categoryId = category.getAttribute("data-category-toggle");
+                self.categoryOpen[categoryId] = !self.categoryOpen[categoryId];
                 self._renderResults();
-            });
-        }
-
-        // Results list delegation
-        var resultsList = container.querySelector('[data-role="results-list"]');
-        if (resultsList) {
-            resultsList.addEventListener("click", function(e) {
-                var item = e.target.closest(".cr-result-item");
-                if (!item) return;
-                var itemId = item.getAttribute("data-item-id");
-                if (itemId) {
-                    self._selectItem(itemId);
-                }
-                // Source button handling
-                var srcBtn = e.target.closest(".cr-source-btn");
-                if (srcBtn) {
-                    e.stopPropagation();
-                    var docType = srcBtn.getAttribute("data-doc-type");
-                    var viewer = srcBtn.getAttribute("data-viewer");
-                    if (docType && viewer) {
-                        self._switchViewerDoc(viewer, docType);
-                    }
-                }
-            });
-        }
-    };
-
-    ContractReview.prototype._displayFile = function(role, file) {
-        // Default display: left = contract, mid = cqp
-        if (role === "contract") {
-            this.leftViewer.loadPDF(file, "contract");
-            this.leftViewer.documentType = "contract";
-        } else if (role === "cqp") {
-            this.midViewer.loadPDF(file, "cqp");
-            this.midViewer.documentType = "cqp";
-        } else if (role === "ta") {
-            // TA goes to mid viewer if no CQP, otherwise could be shown on demand
-            if (!this.selectedFiles.cqp) {
-                this.midViewer.loadPDF(file, "ta");
-                this.midViewer.documentType = "ta";
+                return;
             }
-            // We keep the file ready for switching
-        }
+            var evidenceButton = event.target.closest("[data-evidence-index]");
+            if (evidenceButton) {
+                self._navigateEvidenceChip(evidenceButton);
+                return;
+            }
+            var reviewButton = event.target.closest("[data-review-key]");
+            if (reviewButton) self._selectNode(reviewButton.getAttribute("data-review-key"));
+        });
+    };
+
+    ContractReview.prototype._fileSlotHtml = function (role, label, emptyText) {
+        return '<div class="cr-file-slot" data-slot="' + role + '" role="button" tabindex="0">' +
+            '<span class="cr-file-slot__label">' + label + '</span>' +
+            '<span class="cr-file-slot__name" data-name="' + role + '">' + emptyText + '</span>' +
+            '<input class="cr-file-input-hidden" data-input="' + role + '" type="file" accept="application/pdf,.pdf">' +
+        '</div>';
+    };
+
+    ContractReview.prototype._onFileChange = function (role, file) {
+        this.selectedFiles[role] = file;
         this.fileObjects[role] = file;
-    };
-
-    ContractReview.prototype._switchViewerDoc = function(viewer, docType) {
-        var targetViewer = viewer === "left" ? this.leftViewer : this.midViewer;
-        var file = this.fileObjects[docType];
-        if (file && targetViewer) {
-            targetViewer.loadPDF(file, docType);
-            targetViewer.documentType = docType;
+        var slot = this.container.querySelector('[data-slot="' + role + '"]');
+        var name = this.container.querySelector('[data-name="' + role + '"]');
+        name.textContent = file ? file.name : (role === "ta" ? "未选择（可选）" : "未选择");
+        slot.classList.toggle("has-file", Boolean(file));
+        if (file) {
+            if (role === "contract") this.leftViewer.loadPDF(file, "contract").catch(function () {});
+            if (role === "cqp") this.midViewer.loadPDF(file, "cqp").catch(function () {});
+            if (role === "ta" && !this.selectedFiles.cqp) this.midViewer.loadPDF(file, "ta").catch(function () {});
         }
-    };
-
-    ContractReview.prototype._updateRunButton = function() {
-        var btn = document.getElementById("crBtnRun");
-        if (!btn) return;
-        var hasBoth = !!(this.selectedFiles.contract && this.selectedFiles.cqp);
-        btn.disabled = !hasBoth;
-        if (this.status === "running") {
-            btn.textContent = "测试中...";
-            btn.disabled = true;
-        } else if (this.status === "done") {
-            btn.textContent = "重新测试";
-        } else {
-            btn.textContent = "运行测试";
-        }
-    };
-
-    ContractReview.prototype._setStatus = function(status) {
-        this.status = status;
-        var dot = document.querySelector('[data-role="status-dot"]');
-        var textEl = document.querySelector('[data-role="status-text"]');
-        if (dot) {
-            dot.className = "cr-status-dot";
-            if (status === "idle") dot.classList.add("cr-status-dot--idle");
-            else if (status === "running") dot.classList.add("cr-status-dot--running");
-            else if (status === "done") dot.classList.add("cr-status-dot--done");
-            else if (status === "error") dot.classList.add("cr-status-dot--error");
-        }
-        if (textEl) {
-            if (status === "idle") textEl.textContent = "就绪";
-            else if (status === "running") textEl.textContent = "解析中...";
-            else if (status === "done") textEl.textContent = "完成";
-            else if (status === "error") textEl.textContent = "错误";
-        }
+        this._clearResults();
         this._updateRunButton();
     };
 
-    ContractReview.prototype._clearResults = function() {
+    ContractReview.prototype._updateRunButton = function () {
+        var button = document.getElementById("crBtnRun");
+        var ready = Boolean(this.selectedFiles.contract && this.selectedFiles.cqp && this.status !== "running");
+        button.disabled = !ready;
+        button.textContent = this.reviewResult ? "重新测试" : "运行测试";
+    };
+
+    ContractReview.prototype._setStatus = function (status, text) {
+        this.status = status;
+        var dot = this.container.querySelector('[data-role="status-dot"]');
+        var label = this.container.querySelector('[data-role="status-text"]');
+        dot.className = "cr-status-dot cr-status-dot--" + status;
+        label.textContent = text || ({ idle: "就绪", running: "正在审查", done: "审查完成", error: "运行失败" }[status] || status);
+        this._updateRunButton();
+    };
+
+    ContractReview.prototype._clearResults = function () {
         this.reviewResult = null;
-        this.selectedItemId = null;
+        this.selectedKey = "";
         this.leftViewer.clearHighlights();
         this.midViewer.clearHighlights();
-        var list = document.querySelector('[data-role="results-list"]');
-        if (list) list.innerHTML = '<div class="cr-placeholder">请上传 Contract 和 CQP 文件后运行测试</div>';
-        var stats = document.querySelector('[data-role="summary-stats"]');
+        var list = this.container.querySelector('[data-role="results-list"]');
+        if (list) list.innerHTML = '<div class="cr-placeholder">文件已变化，请重新运行测试</div>';
+        var stats = this.container.querySelector('[data-role="summary-stats"]');
         if (stats) stats.innerHTML = "";
-        var aiNotice = document.querySelector('[data-role="ai-notice"]');
-        if (aiNotice) aiNotice.hidden = true;
-        this.currentFilter = "needs_check";
-        var filterBar = document.querySelector('[data-role="filter-bar"]');
-        if (filterBar) {
-            filterBar.querySelectorAll(".cr-filter-btn").forEach(function(b) {
-                b.classList.toggle("active", b.getAttribute("data-filter") === "needs_check");
-            });
-        }
         this._setStatus("idle");
     };
 
-    ContractReview.prototype._runReview = function() {
+    ContractReview.prototype._runReview = function () {
         var self = this;
-        if (this.status === "running") return;
-
+        if (!this.selectedFiles.contract || !this.selectedFiles.cqp) return;
         this._setStatus("running");
-        this.reviewResult = null;
-        this.selectedItemId = null;
+        this.selectedKey = "";
+        this.leftViewer.clearHighlights();
+        this.midViewer.clearHighlights();
+        this.container.querySelector('[data-role="results-list"]').innerHTML = '<div class="cr-placeholder"><span class="cr-spinner"></span>正在读取并校对文件...</div>';
 
-        var list = document.querySelector('[data-role="results-list"]');
-        if (list) list.innerHTML = '<div class="cr-loading"><div class="cr-spinner"></div><div>正在解析 PDF 并执行交叉验证...</div></div>';
-
-        // Build FormData with named fields
         var formData = new FormData();
-        if (this.selectedFiles.contract) formData.append("contract", this.selectedFiles.contract);
-        if (this.selectedFiles.cqp) formData.append("cqp", this.selectedFiles.cqp);
+        formData.append("contract", this.selectedFiles.contract);
+        formData.append("cqp", this.selectedFiles.cqp);
         if (this.selectedFiles.ta) formData.append("ta", this.selectedFiles.ta);
 
-        fetch("/api/contract-review", {
-            method: "POST",
-            body: formData,
-        })
-        .then(function(resp) {
-            if (!resp.ok) {
-                return resp.json().then(function(err) {
-                    throw new Error(err.error || "请求失败");
+        fetch("/api/contract-review", { method: "POST", body: formData })
+            .then(function (response) {
+                return response.json().catch(function () { return {}; }).then(function (payload) {
+                    if (!response.ok) throw new Error(payload.error || "请求失败");
+                    return payload;
                 });
-            }
-            return resp.json();
-        })
-        .then(function(report) {
-            self.reviewResult = report;
-            self._setStatus("done");
-            self._renderResults();
-        })
-        .catch(function(err) {
-            self._setStatus("error");
-            if (list) {
-                list.innerHTML = '<div class="cr-placeholder" style="color:var(--abb-red)">审查失败: ' + self._escape(err.message || "未知错误") + '</div>';
-            }
-            self._showToast(err.message || "审查请求失败", "danger");
-        });
+            })
+            .then(function (result) {
+                self.reviewResult = result;
+                var taSource = result.document_sources && result.document_sources.ta;
+                self.fileObjects.ta = taSource && taSource.physical_role === "contract" ? self.selectedFiles.contract : self.selectedFiles.ta;
+                self._initializeCategoryState();
+                self._setStatus("done");
+                self._renderResults();
+            })
+            .catch(function (error) {
+                self._setStatus("error");
+                self.container.querySelector('[data-role="results-list"]').innerHTML = '<div class="cr-placeholder cr-placeholder--error">审查失败：' + escapeHtml(error.message) + '</div>';
+                self._showToast(error.message || "审查失败", "danger");
+            });
     };
 
-    ContractReview.prototype._escape = function(str) {
-        return String(str || "").replace(/&/g, "&").replace(/</g, "<").replace(/>/g, ">");
-    };
-
-    ContractReview.prototype._renderResults = function() {
+    ContractReview.prototype._initializeCategoryState = function () {
         var self = this;
-        if (!this.reviewResult) return;
-
-        var items = this.reviewResult.review_items || [];
-        var llm = this.reviewResult.llm_review || {};
-
-        // Update summary stats
-        var stats = document.querySelector('[data-role="summary-stats"]');
-        var blockers = 0, warnings = 0, passes = 0, aiAvailable = !llm.error;
-        items.forEach(function(item) {
-            if (item.severity === "blocker" || item.status === "BLOCKER" || item.status === "MISMATCH") blockers++;
-            else if (item.severity === "warning" || item.status === "WARNING" || item.status === "UNDETERMINED") warnings++;
-            else if (item.status === "PASS") passes++;
+        CATEGORY_ORDER.forEach(function (category) {
+            var items = (self.reviewResult.review_items || []).filter(function (item) { return item.category === category; });
+            self.categoryOpen[category] = items.some(function (item) { return statusKind(item) !== "pass" && statusKind(item) !== "info"; });
         });
+    };
 
-        if (stats) {
-            stats.innerHTML =
-                '<span class="cr-stat-item"><span class="cr-stat-dot cr-stat-dot--blocker"></span>Blocker: ' + blockers + '</span>' +
-                '<span class="cr-stat-item"><span class="cr-stat-dot cr-stat-dot--warning"></span>Warning: ' + warnings + '</span>' +
-                '<span class="cr-stat-item"><span class="cr-stat-dot cr-stat-dot--pass"></span>已通过: ' + passes + '</span>' +
-                '<span class="cr-stat-item"><span class="cr-stat-dot cr-stat-dot--ai"></span>AI: ' + (aiAvailable ? '可用' : '不可用') + '</span>';
-        }
+    ContractReview.prototype._passesFilter = function (node) {
+        var kind = statusKind(node);
+        if (this.currentFilter === "all") return true;
+        if (this.currentFilter === "blocker") return kind === "blocker";
+        if (this.currentFilter === "warning") return kind === "warning";
+        if (this.currentFilter === "pass") return kind === "pass";
+        return kind === "blocker" || kind === "warning";
+    };
 
-        // AI notice
-        var aiNotice = document.querySelector('[data-role="ai-notice"]');
-        if (aiNotice) {
-            if (llm.error) {
-                aiNotice.hidden = false;
-                aiNotice.className = "cr-ai-notice cr-ai-notice--error";
-                aiNotice.textContent = "AI 审核不可用: " + (llm.error || "未知错误");
-            } else if (llm.summary) {
-                aiNotice.hidden = false;
-                aiNotice.className = "cr-ai-notice";
-                aiNotice.textContent = "AI: " + llm.summary;
-            } else {
-                aiNotice.hidden = true;
-            }
-        }
-
-        // Filter items
-        var filtered = this._filterItems(items);
-        var list = document.querySelector('[data-role="results-list"]');
-        if (!list) return;
-
-        if (filtered.length === 0) {
-            list.innerHTML = '<div class="cr-placeholder">无匹配的检查结果</div>';
-            return;
-        }
+    ContractReview.prototype._renderResults = function () {
+        if (!this.reviewResult) return;
+        var items = this.reviewResult.review_items || [];
+        this._renderSummary(items);
+        this._renderAiNotice();
+        var categories = {};
+        CATEGORY_ORDER.forEach(function (id) { categories[id] = []; });
+        items.forEach(function (item) {
+            if (!categories[item.category]) categories[item.category] = [];
+            categories[item.category].push(item);
+        });
 
         var html = "";
-        filtered.forEach(function(item) {
-            var isSelected = item.id === self.selectedItemId;
-            var sevLabel = item.severity === "blocker" ? "BLOCKER" : item.severity === "warning" ? "WARNING" : item.severity === "info" ? "INFO" : (item.severity || "").toUpperCase();
-            var sevClass = "cr-result-item__severity--" + (item.severity || "info");
+        var anyVisible = false;
+        for (var c = 0; c < CATEGORY_ORDER.length; c++) {
+            var categoryId = CATEGORY_ORDER[c];
+            var visible = categories[categoryId].filter(this._passesFilter.bind(this));
+            if (!visible.length) continue;
+            anyVisible = true;
+            var issueCount = visible.filter(function (item) { return statusKind(item) !== "pass"; }).length;
+            var open = Boolean(this.categoryOpen[categoryId]);
+            html += '<section class="cr-category' + (open ? " is-open" : "") + '">';
+            html += '<button class="cr-category__header" data-category-toggle="' + categoryId + '" type="button" aria-expanded="' + open + '">';
+            html += '<span class="cr-category__chevron">›</span><span class="cr-category__title">' + escapeHtml(CATEGORY_FALLBACK[categoryId]) + '</span>';
+            html += '<span class="cr-category__count">' + visible.length + ' 项' + (issueCount ? ' · ' + issueCount + ' 待处理' : '') + '</span></button>';
+            if (open) {
+                html += '<div class="cr-category__body">';
+                for (var i = 0; i < visible.length; i++) html += this._renderReviewNode(visible[i], visible[i].id, false);
+                html += '</div>';
+            }
+            html += '</section>';
+        }
+        this.container.querySelector('[data-role="results-list"]').innerHTML = anyVisible ? html : '<div class="cr-placeholder">当前筛选条件下没有检查项</div>';
+    };
 
-            html += '<button class="cr-result-item' + (isSelected ? " selected" : "") + '" data-item-id="' + self._escape(item.id) + '" type="button">';
-            html += '<div class="cr-result-item__header">';
-            html += '<span class="cr-result-item__title">' + self._escape(item.title) + '</span>';
-            html += '<span class="cr-result-item__severity ' + sevClass + '">' + self._escape(sevLabel) + '</span>';
+    ContractReview.prototype._renderReviewNode = function (node, key, nested) {
+        var selected = this.selectedKey === key;
+        var kind = statusKind(node);
+        var html = '<article class="cr-review-node ' + (nested ? 'cr-review-node--nested ' : '') + (selected ? 'is-selected' : '') + '">';
+        html += '<button class="cr-review-node__button" data-review-key="' + escapeHtml(key) + '" type="button">';
+        html += '<span class="cr-review-node__main"><span class="cr-review-node__title">' + escapeHtml(node.title || node.code || "检查项") + '</span>';
+        html += '<span class="cr-review-node__summary">' + escapeHtml(node.summary || "") + '</span></span>';
+        html += '<span class="cr-status-badge cr-status-badge--' + kind + '">' + escapeHtml(statusLabel(node)) + '</span></button>';
+
+        if (node.values && Object.keys(node.values).length) {
+            html += '<dl class="cr-review-values">';
+            Object.keys(node.values).forEach(function (label) {
+                html += '<div><dt>' + escapeHtml(label) + '</dt><dd>' + escapeHtml(String(node.values[label])) + '</dd></div>';
+            });
+            html += '</dl>';
+        }
+        var evidence = uniqueEvidence(node.evidence || []);
+        if (evidence.length) {
+            html += '<div class="cr-evidence-list">';
+            evidence.forEach(function (entry, index) {
+                var loc = Number(entry.page) > 0 ? (entry.document_type.toUpperCase() + ' 第' + entry.page + '页') : '无法确定位置';
+                var exactClass = entry.location_status === "exact" && entry.rects && entry.rects.length ? "" : " cr-evidence-chip--uncertain";
+                html += '<button class="cr-evidence-chip' + exactClass + '" data-review-key="' + escapeHtml(key) + '" data-evidence-index="' + index + '" type="button">' + escapeHtml(loc) + '</button>';
+            });
             html += '</div>';
-            html += '<div class="cr-result-item__summary">' + self._escape(item.summary || "") + '</div>';
-
-            // Values
-            if (item.values) {
-                html += '<div class="cr-result-item__meta">';
-                for (var key in item.values) {
-                    if (item.values.hasOwnProperty(key)) {
-                        html += '<span class="cr-result-item__meta-item">' + self._escape(key) + ': ' + self._escape(String(item.values[key])) + '</span>';
-                    }
-                }
-                html += '</div>';
-            }
-
-            // Evidence pages
-            if (item.evidence && item.evidence.length > 0) {
-                html += '<div class="cr-result-item__meta" style="margin-top:4px">';
-                item.evidence.forEach(function(ev) {
-                    html += '<span class="cr-result-item__meta-item">' + self._escape(ev.document_type || "") + ' 第' + (ev.page || "?") + '页</span>';
-                });
-                html += '</div>';
-            }
-
-            // Source buttons for sub-items
-            if (item.sub_items && item.sub_items.length > 0) {
-                html += '<div class="cr-source-btns">';
-                item.sub_items.slice(0, 5).forEach(function(sub) {
-                    html += '<button class="cr-source-btn" data-doc-type="cqp" data-viewer="mid" type="button">' + self._escape(sub.code || "") + ' CQP</button>';
-                });
-                html += '</div>';
-            }
-
-            html += '</button>';
-        });
-
-        list.innerHTML = html;
-    };
-
-    ContractReview.prototype._filterItems = function(items) {
-        var self = this;
-        return items.filter(function(item) {
-            if (self.currentFilter === "all") return true;
-            if (self.currentFilter === "blocker") return item.severity === "blocker" || item.status === "BLOCKER" || item.status === "MISMATCH";
-            if (self.currentFilter === "warning") return item.severity === "warning" || item.status === "WARNING" || item.status === "UNDETERMINED";
-            if (self.currentFilter === "pass") return item.status === "PASS";
-            // "needs_check" - default
-            return item.severity !== "info" && item.status !== "PASS";
-        });
-    };
-
-    ContractReview.prototype._selectItem = function(itemId) {
-        if (!this.reviewResult) return;
-
-        var items = this.reviewResult.review_items || [];
-        var item = null;
-        for (var i = 0; i < items.length; i++) {
-            if (items[i].id === itemId) { item = items[i]; break; }
         }
-        if (!item) return;
+        if (node.sub_items && node.sub_items.length) {
+            html += '<div class="cr-subitems">';
+            for (var i = 0; i < node.sub_items.length; i++) {
+                html += this._renderReviewNode(node.sub_items[i], key + "::" + node.sub_items[i].id, true);
+            }
+            html += '</div>';
+        }
+        html += '</article>';
+        return html;
+    };
 
-        this.selectedItemId = itemId;
-        this._renderResults();
-
-        // Navigate PDF viewers to evidence
-        var evidence = item.evidence || [];
-
-        // Determine which docs are involved and assign to viewers
-        var hasContract = false, hasCqp = false, hasTa = false;
-        evidence.forEach(function(ev) {
-            if (ev.document_type === "contract") hasContract = true;
-            if (ev.document_type === "cqp") hasCqp = true;
-            if (ev.document_type === "ta") hasTa = true;
+    ContractReview.prototype._renderSummary = function (items) {
+        var counts = { blocker: 0, warning: 0, pass: 0 };
+        items.forEach(function (item) {
+            var kind = statusKind(item);
+            if (counts.hasOwnProperty(kind)) counts[kind] += 1;
         });
+        this.container.querySelector('[data-role="summary-stats"]').innerHTML =
+            '<span class="cr-stat-item"><i class="cr-stat-dot cr-stat-dot--blocker"></i>阻断 ' + counts.blocker + '</span>' +
+            '<span class="cr-stat-item"><i class="cr-stat-dot cr-stat-dot--warning"></i>警告 ' + counts.warning + '</span>' +
+            '<span class="cr-stat-item"><i class="cr-stat-dot cr-stat-dot--pass"></i>通过 ' + counts.pass + '</span>';
+    };
 
-        // Default: left=contract, mid=cqp
-        // If only contract+ta: left=contract, mid=ta
-        // If only cqp+ta: left=cqp, mid=ta
-        if (!hasContract && hasCqp && hasTa) {
-            this._switchViewerDoc("left", "cqp");
-            this._switchViewerDoc("mid", "ta");
-        } else if (hasContract && !hasCqp && hasTa) {
-            this._switchViewerDoc("left", "contract");
-            this._switchViewerDoc("mid", "ta");
+    ContractReview.prototype._renderAiNotice = function () {
+        var notice = this.container.querySelector('[data-role="ai-notice"]');
+        var llm = this.reviewResult.llm_review || {};
+        if (llm.error) {
+            notice.hidden = false;
+            notice.className = "cr-ai-notice cr-ai-notice--error";
+            notice.textContent = "AI 审核不可用；规则检查和 PDF 定位仍可使用。";
+        } else if (llm.summary) {
+            notice.hidden = false;
+            notice.className = "cr-ai-notice";
+            notice.textContent = "AI：" + llm.summary;
         } else {
-            if (hasContract && this.leftViewer.documentType !== "contract") {
-                this._switchViewerDoc("left", "contract");
-            }
-            if (hasCqp && this.midViewer.documentType !== "cqp") {
-                this._switchViewerDoc("mid", "cqp");
-            }
-        }
-
-        // Separate evidence by target viewer
-        var leftEvidence = evidence.filter(function(ev) {
-            return ev.document_type === "contract" || (ev.document_type === "cqp" && !hasContract);
-        });
-        var midEvidence = evidence.filter(function(ev) {
-            return ev.document_type === "cqp" || ev.document_type === "ta";
-        });
-
-        // Apply
-        if (leftEvidence.length > 0) {
-            this.leftViewer.navigateToEvidence(leftEvidence, "cr-highlight-rect--left");
-        }
-        if (midEvidence.length > 0) {
-            this.midViewer.navigateToEvidence(midEvidence, "cr-highlight-rect--mid");
-        }
-
-        // If no evidence but has page numbers, still navigate
-        if (evidence.length === 0) {
-            this.leftViewer.clearHighlights();
-            this.midViewer.clearHighlights();
+            notice.hidden = true;
         }
     };
 
-    ContractReview.prototype._showToast = function(message, tone) {
-        try {
-            var container = document.getElementById("toastContainer");
-            if (!container) return;
-            var toast = document.createElement("div");
-            toast.className = "toast toast--" + (tone || "success");
-            toast.textContent = message;
-            container.appendChild(toast);
-            setTimeout(function() { toast.style.opacity = "0"; toast.style.transform = "translateY(8px)"; }, 2400);
-            setTimeout(function() { if (toast.parentNode) toast.parentNode.removeChild(toast); }, 2900);
-        } catch (e) {}
+    ContractReview.prototype._findNode = function (key) {
+        var parts = String(key || "").split("::");
+        var items = this.reviewResult ? this.reviewResult.review_items || [] : [];
+        var item = items.find(function (entry) { return entry.id === parts[0]; });
+        if (!item) return null;
+        if (parts.length === 1) return { node: item, parent: item, key: key };
+        var sub = (item.sub_items || []).find(function (entry) { return entry.id === parts[1]; });
+        return sub ? { node: sub, parent: item, key: key } : null;
     };
 
-    // Export
+    ContractReview.prototype._chooseViewerRoles = function (evidence) {
+        var docs = {};
+        evidence.forEach(function (entry) { if (entry.document_type) docs[entry.document_type] = true; });
+        if (docs.contract && docs.cqp) return { left: "contract", mid: "cqp" };
+        if (docs.contract && docs.ta) return { left: "contract", mid: "ta" };
+        if (docs.cqp && docs.ta) return { left: "cqp", mid: "ta" };
+        if (docs.ta) return { left: this.leftViewer.documentType || "contract", mid: "ta" };
+        if (docs.cqp) return { left: this.leftViewer.documentType || "contract", mid: "cqp" };
+        return { left: "contract", mid: this.midViewer.documentType || "cqp" };
+    };
+
+    ContractReview.prototype._switchViewerDoc = function (panel, role) {
+        var viewer = panel === "left" ? this.leftViewer : this.midViewer;
+        var file = this.fileObjects[role];
+        if (!file) {
+            viewer._setLocationMessage("无法确定位置");
+            return Promise.resolve(false);
+        }
+        if (viewer.documentType === role && viewer.pdfDoc) return Promise.resolve(true);
+        return viewer.loadPDF(file, role).then(function () { return true; }).catch(function () { return false; });
+    };
+
+    ContractReview.prototype._selectNode = function (key) {
+        var self = this;
+        var found = this._findNode(key);
+        if (!found) return;
+        this.selectedKey = key;
+        this.categoryOpen[found.parent.category] = true;
+        this._renderResults();
+        var evidence = uniqueEvidence(found.node.evidence && found.node.evidence.length ? found.node.evidence : found.parent.evidence || []);
+        var roles = this._chooseViewerRoles(evidence);
+        Promise.all([
+            this._switchViewerDoc("left", roles.left),
+            this._switchViewerDoc("mid", roles.mid)
+        ]).then(function () {
+            var leftEvidence = evidence.filter(function (entry) { return entry.document_type === roles.left; });
+            var midEvidence = evidence.filter(function (entry) { return entry.document_type === roles.mid; });
+            return Promise.all([
+                self.leftViewer.navigateToEvidence(leftEvidence, statusKind(found.node) === "blocker" ? "cr-highlight-rect--left cr-highlight-rect--error" : "cr-highlight-rect--left"),
+                self.midViewer.navigateToEvidence(midEvidence, statusKind(found.node) === "blocker" ? "cr-highlight-rect--mid cr-highlight-rect--error" : "cr-highlight-rect--mid")
+            ]);
+        }).then(function (exactResults) {
+            if (!evidence.length || exactResults.some(function (value) { return value === false; })) self._showToast("无法确定位置", "warning");
+        });
+    };
+
+    ContractReview.prototype._navigateEvidenceChip = function (button) {
+        var key = button.getAttribute("data-review-key");
+        var index = Number(button.getAttribute("data-evidence-index"));
+        var found = this._findNode(key);
+        if (!found) return;
+        var evidence = uniqueEvidence(found.node.evidence && found.node.evidence.length ? found.node.evidence : found.parent.evidence || []);
+        var entry = evidence[index];
+        if (!entry) return;
+        var panel = entry.document_type === "contract" ? "left" : "mid";
+        var viewer = panel === "left" ? this.leftViewer : this.midViewer;
+        var self = this;
+        this._switchViewerDoc(panel, entry.document_type).then(function () {
+            return viewer.navigateToEvidence([entry], panel === "left" ? "cr-highlight-rect--left" : "cr-highlight-rect--mid");
+        }).then(function (exact) {
+            if (!exact) self._showToast("无法确定位置", "warning");
+        });
+    };
+
+    ContractReview.prototype._showToast = function (message, tone) {
+        var container = document.getElementById("toastContainer");
+        if (!container) return;
+        var toast = document.createElement("div");
+        toast.className = "toast toast--" + (tone || "success");
+        toast.textContent = message;
+        container.appendChild(toast);
+        window.setTimeout(function () { toast.classList.add("toast--leaving"); }, 2200);
+        window.setTimeout(function () { if (toast.parentNode) toast.parentNode.removeChild(toast); }, 2700);
+    };
+
     window.ContractReview = ContractReview;
 })();
