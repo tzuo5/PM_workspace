@@ -1,0 +1,124 @@
+/* ABB Design Tokens */
+:root {
+    /* ABB Brand Colors */
+    --abb-red: #FF000F;
+    --abb-red-light: #ff957e;
+    --abb-red-lighter: #ffdccd;
+    --abb-lilac: #6764f6;
+    --abb-lilac-light: #93a1ff;
+    --abb-lilac-lighter: #e4e7ff;
+
+    /* Neutral Colors */
+    --gray-50: #f9fafb;
+    --gray-100: #f3f4f6;
+    --gray-200: #e5e7eb;
+    --gray-300: #d1d5db;
+    --gray-400: #9ca3af;
+    --gray-500: #6b7280;
+    --gray-600: #4b5563;
+    --gray-700: #374151;
+    --gray-800: #1f2937;
+    --gray-900: #111827;
+
+    /* Functional Colors */
+    --color-primary: #FF000F;
+    --color-primary-hover: #cc000c;
+    --color-success: #10b981;
+    --color-warning: #f59e0b;
+    --color-danger: #ef4444;
+    --color-info: #3b82f6;
+
+    /* Background */
+    --bg-primary: #ffffff;
+    --bg-secondary: #f9fafb;
+    --bg-tertiary: #f3f4f6;
+    --bg-sidebar: #1f2937;
+    --bg-header: #ffffff;
+
+    /* Text */
+    --text-primary: #111827;
+    --text-secondary: #6b7280;
+    --text-tertiary: #9ca3af;
+    --text-inverse: #ffffff;
+
+    /* Border */
+    --border-color: #e5e7eb;
+    --border-color-light: #f3f4f6;
+
+    /* Spacing */
+    --space-xs: 4px;
+    --space-sm: 8px;
+    --space-md: 12px;
+    --space-lg: 16px;
+    --space-xl: 20px;
+    --space-2xl: 24px;
+    --space-3xl: 32px;
+
+    /* Border Radius */
+    --radius-sm: 4px;
+    --radius-md: 8px;
+    --radius-lg: 12px;
+    --radius-xl: 16px;
+
+    /* Shadows */
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.05);
+    --shadow-md: 0 4px 6px -1px rgba(0,0,0,0.1);
+    --shadow-lg: 0 10px 15px -3px rgba(0,0,0,0.1);
+    --shadow-xl: 0 20px 25px -5px rgba(0,0,0,0.1);
+
+    /* Layout */
+    --header-height: 56px;
+    --sidebar-width: 200px;
+    --sidebar-collapsed-width: 56px;
+
+    /* Typography */
+    --font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --font-size-xs: 11px;
+    --font-size-sm: 12px;
+    --font-size-md: 13px;
+    --font-size-base: 14px;
+    --font-size-lg: 16px;
+    --font-size-xl: 18px;
+    --font-size-2xl: 24px;
+
+    /* Transitions */
+    --transition-fast: 0.15s ease;
+    --transition-base: 0.2s ease;
+    --transition-slow: 0.3s ease;
+}
+
+/* Dark View Tokens */
+:root[data-theme="dark"] {
+    --abb-red-lighter: rgba(255, 0, 15, 0.16);
+    --abb-lilac-lighter: rgba(103, 100, 246, 0.18);
+
+    --gray-50: #15171d;
+    --gray-100: #1b1e25;
+    --gray-200: #2b303a;
+    --gray-300: #3a404c;
+    --gray-400: #6f7785;
+    --gray-500: #9aa3b2;
+    --gray-600: #b8c0cc;
+    --gray-700: #d1d7e0;
+    --gray-800: #e4e8ee;
+    --gray-900: #f5f7fa;
+
+    --bg-primary: #171a21;
+    --bg-secondary: #0f1117;
+    --bg-tertiary: #20242d;
+    --bg-sidebar: #090b10;
+    --bg-header: #13161d;
+
+    --text-primary: #f4f6f8;
+    --text-secondary: #b8c0cc;
+    --text-tertiary: #7d8795;
+    --text-inverse: #ffffff;
+
+    --border-color: #2b303a;
+    --border-color-light: #242935;
+
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.35);
+    --shadow-md: 0 8px 18px rgba(0,0,0,0.32);
+    --shadow-lg: 0 18px 36px rgba(0,0,0,0.38);
+    --shadow-xl: 0 28px 56px rgba(0,0,0,0.46);
+}

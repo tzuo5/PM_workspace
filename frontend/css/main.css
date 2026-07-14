@@ -1,0 +1,49 @@
+/* Main Entry - Import all stylesheets */
+@import "variables.css";
+@import "reset.css";
+@import "layout.css";
+@import "components.css";
+
+/* Responsive */
+@media (max-width: 1200px) {
+    .kanban-column {
+        min-width: 200px;
+    }
+
+    .tracker-header {
+        flex-direction: column;
+    }
+
+    .tracker-header__right {
+        width: 100%;
+        justify-content: flex-start;
+    }
+}
+
+@media (max-width: 768px) {
+    .sidebar {
+        width: var(--sidebar-collapsed-width);
+    }
+
+    .sidebar .nav-item span,
+    .sidebar .nav-badge {
+        display: none;
+    }
+
+    .content {
+        margin-left: var(--sidebar-collapsed-width);
+    }
+
+    .tracker-content {
+        padding: var(--space-md);
+    }
+
+    .tracker-toolbar {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .toolbar-search {
+        min-width: 100%;
+    }
+}

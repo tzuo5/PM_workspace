@@ -1,0 +1,30 @@
+# OS
+Thumbs.db
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+*.egg
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# Secrets — DO NOT COMMIT API KEYS
+backend/config/llm_config.json
+
+# Data (attachments, db)
+backend/data/
+*.db
+*.sqlite3
+*.sqlite
+
+# Logs
+*.log
+
+# Temp / pywin32 gen_py cache
+gen_py/
