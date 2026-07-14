@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PM Workplace | ABB</title>
     <link rel="stylesheet" href="css/main.css">
+    <link rel="stylesheet" href="css/contract-review.css">
     <script>
         (function() {
             try {
@@ -86,6 +87,16 @@
                         <line x1="6" y1="20" x2="6" y2="14"/>
                     </svg>
                     <span class="nav-label">统计</span>
+                </a>
+                <a href="#" class="nav-item" data-section="contract-review">
+                    <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>
+                        <polyline points="14,2 14,8 20,8"/>
+                        <line x1="16" y1="13" x2="8" y2="13"/>
+                        <line x1="16" y1="17" x2="8" y2="17"/>
+                        <polyline points="10,9 9,9 8,9"/>
+                    </svg>
+                    <span class="nav-label">合同对比</span>
                 </a>
                 <div class="nav-divider"></div>
                 <a href="#" class="nav-item" data-section="settings">
@@ -240,13 +251,14 @@
                 <div class="kanban-board" id="kanbanBoard"></div>
             </div>
 
+            <div class="contract-review-content" id="contractReviewContent" hidden></div>
             <section class="under-development" id="underDevelopment" hidden>
                 <div class="under-development__card">
                     <div class="under-development__stripe"></div>
                     <div class="under-development__eyebrow">ABB PM Workplace</div>
                     <h1 class="under-development__title" id="underDevelopmentTitle">正在开发中</h1>
                     <p class="under-development__desc" id="underDevelopmentDesc">
-                        该模块尚未接入正式业务逻辑。当前版本优先开放“项目跟踪”，其他模块会在后续迭代中补齐。
+                        该模块尚未接入正式业务逻辑。当前版本优先开放"项目跟踪"，其他模块会在后续迭代中补齐。
                     </p>
                     <button class="btn btn--primary" id="btnBackToTracker" type="button">返回项目跟踪</button>
                 </div>
@@ -467,6 +479,8 @@
     <script src="js/data.js"></script>
     <script src="js/api.js"></script>
     <script src="js/sidebar.js"></script>
+    <script src="vendor/pdfjs/build/pdf.js"></script>
+    <script src="js/contract-review.js"></script>
     <script src="js/app.js"></script>
 </body>
 </html>

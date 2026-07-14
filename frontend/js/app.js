@@ -710,9 +710,11 @@ var OrderTracker = (function() {
 
     OrderTracker.prototype.handleSidebarNavigation = function(detail) {
         var section = detail.section || "tracker";
-        var title = detail.title || "该模块";
+        var title = detail.title || "\u8be5\u6a21\u5757";
         if (section === "tracker") {
             this.showTrackerPage();
+        } else if (section === "contract-review") {
+            this.showContractReviewPage();
         } else {
             this.showUnderDevelopmentPage(title);
         }
@@ -721,20 +723,39 @@ var OrderTracker = (function() {
     OrderTracker.prototype.showTrackerPage = function() {
         var tracker = this.getEl("trackerContent");
         var underDevelopment = this.getEl("underDevelopment");
+        var contractReview = this.getEl("contractReviewContent");
         if (tracker) tracker.hidden = false;
         if (underDevelopment) underDevelopment.hidden = true;
+        if (contractReview) contractReview.hidden = true;
     };
 
     OrderTracker.prototype.showUnderDevelopmentPage = function(sectionTitle) {
         var tracker = this.getEl("trackerContent");
         var underDevelopment = this.getEl("underDevelopment");
+        var contractReview = this.getEl("contractReviewContent");
         var title = this.getEl("underDevelopmentTitle");
         var desc = this.getEl("underDevelopmentDesc");
         if (tracker) tracker.hidden = true;
         if (underDevelopment) underDevelopment.hidden = false;
-        if (title) title.textContent = sectionTitle + " · 正在开发中";
+        if (contractReview) contractReview.hidden = true;
+        if (title) title.textContent = sectionTitle + " \u00b7 \u6b63\u5728\u5f00\u53d1\u4e2d";
         if (desc) {
-            desc.textContent = "“" + sectionTitle + "”模块暂未接入正式业务逻辑。当前版本只开放项目跟踪；该页面用于占位，避免点击左侧导航后无反馈。";
+            desc.textContent = "\u201c" + sectionTitle + "\u201d\u6a21\u5757\u6682\u672a\u63a5\u5165\u6b63\u5f0f\u4e1a\u52a1\u903b\u8f91\u3002\u5f53\u524d\u7248\u672c\u53ea\u5f00\u653e\u9879\u76ee\u8ddf\u8e2a\uff1b\u8be5\u9875\u9762\u7528\u4e8e\u5360\u4f4d\uff0c\u907f\u514d\u70b9\u51fb\u5de6\u4fa7\u5bfc\u822a\u540e\u65e0\u53cd\u9988\u3002";
+        }
+    };
+
+    OrderTracker.prototype.showContractReviewPage = function() {
+        var tracker = this.getEl("trackerContent");
+        var underDevelopment = this.getEl("underDevelopment");
+        var contractReview = this.getEl("contractReviewContent");
+        if (tracker) tracker.hidden = true;
+        if (underDevelopment) underDevelopment.hidden = true;
+        if (contractReview) {
+            contractReview.hidden = false;
+            // Initialize ContractReview module on first visit
+            if (!this._contractReviewInstance && typeof ContractReview !== "undefined") {
+                this._contractReviewInstance = new ContractReview();
+            }
         }
     };
 
@@ -1815,3 +1836,472 @@ var OrderTracker = (function() {
 document.addEventListener("DOMContentLoaded", function() {
     new OrderTracker();
 });
+
+// ==============================
+// Contract Review JS Logic
+// ==============================
+
+function initContractReview() {
+    var selectedFiles = { contract: null, cqp: null, ta: null };
+
+    // Upload card buttons
+    document.querySelectorAll(".cr-upload-btn").forEach(function(btn) {
+        btn.addEventListener("click", function(e) {
+            e.stopPropagation();
+            var targetId = btn.getAttribute("data-target");
+            var fileInput = document.getElementById(targetId);
+            if (fileInput) fileInput.click();
+        });
+    });
+
+    // Also make entire card clickable
+    document.querySelectorAll(".cr-upload-card").forEach(function(card) {
+        card.addEventListener("click", function() {
+            var btn = card.querySelector(".cr-upload-btn");
+            if (btn) btn.click();
+        });
+    });
+
+    // File input change handlers
+    var fileInputs = [
+        { id: "crFileContract", type: "contract", nameId: "crFileNameContract" },
+        { id: "crFileCqp", type: "cqp", nameId: "crFileNameCqp" },
+        { id: "crFileTa", type: "ta", nameId: "crFileNameTa" },
+    ];
+
+    fileInputs.forEach(function(fi) {
+        var input = document.getElementById(fi.id);
+        var nameEl = document.getElementById(fi.nameId);
+        if (!input || !nameEl) return;
+
+        input.addEventListener("change", function() {
+            var file = input.files[0];
+            if (file) {
+                selectedFiles[fi.type] = file;
+                nameEl.textContent = file.name;
+                var card = input.closest(".cr-upload-card");
+                if (card) card.classList.add("has-file");
+            } else {
+                selectedFiles[fi.type] = null;
+                nameEl.textContent = "";
+                var card = input.closest(".cr-upload-card");
+                if (card) card.classList.remove("has-file");
+            }
+            updateStartButton();
+        });
+    });
+
+    // Start review button
+    var startBtn = document.getElementById("btnStartReview");
+    if (startBtn) {
+        startBtn.addEventListener("click", function() {
+            startReview();
+        });
+    }
+
+    function updateStartButton() {
+        if (startBtn) {
+            var hasRequired = !!(selectedFiles.contract || selectedFiles.cqp);
+            startBtn.disabled = !hasRequired;
+        }
+    }
+
+    function startReview() {
+        var files = [];
+        if (selectedFiles.contract) files.push(selectedFiles.contract);
+        if (selectedFiles.cqp) files.push(selectedFiles.cqp);
+        if (selectedFiles.ta) files.push(selectedFiles.ta);
+
+        if (files.length === 0) {
+            showCRToast("请至少上传一个 PDF 文件", "warning");
+            return;
+        }
+
+        // Show loading
+        var uploadSection = document.getElementById("crUploadSection");
+        var resultsSection = document.getElementById("crResultsSection");
+        var resultsContainer = document.getElementById("crResultsContainer");
+
+        if (uploadSection) uploadSection.hidden = true;
+        if (resultsSection) resultsSection.hidden = false;
+        if (resultsContainer) {
+            resultsContainer.innerHTML = '<div class="cr-loading"><div class="cr-spinner"></div><div class="cr-loading__text">正在解析PDF并执行交叉验证...</div></div>';
+        }
+
+        // Build FormData
+        var formData = new FormData();
+        files.forEach(function(f) {
+            formData.append("files", f);
+        });
+
+        // Send to backend
+        fetch("/api/contract-review", {
+            method: "POST",
+            body: formData,
+        })
+        .then(function(resp) {
+            if (!resp.ok) {
+                return resp.json().then(function(err) {
+                    throw new Error(err.error || "Request failed");
+                });
+            }
+            return resp.json();
+        })
+        .then(function(report) {
+            renderReport(report);
+        })
+        .catch(function(err) {
+            if (resultsContainer) {
+                resultsContainer.innerHTML = '<div class="cr-result-card"><div class="cr-result-card__header"><div class="cr-status-icon cr-status-blocked">!</div>审查失败</div><div class="cr-result-card__body"><p>' + escapeHTML(err.message || "未知错误") + '</p><button class="btn btn--outline" onclick="location.reload()">重试</button></div></div>';
+            }
+            showCRToast(err.message || "审查请求失败", "danger");
+        });
+    }
+
+    function renderReport(report) {
+        var container = document.getElementById("crResultsContainer");
+        if (!container) return;
+
+        var html = "";
+
+        // =============================================
+        // 1. LLM DeepSeek Review (Primary AI Assessment)
+        // =============================================
+        var llmReview = report.llm_review || {};
+        if (llmReview.overall_assessment || llmReview.summary) {
+            var llmBannerClass = "cr-conclusion-banner--blocked";
+            if (llmReview.overall_assessment === "Pass") llmBannerClass = "cr-conclusion-banner--pass";
+            else if (llmReview.overall_assessment === "Pass with notes") llmBannerClass = "cr-conclusion-banner--warning";
+
+            var llmTitle = llmReview.overall_assessment || "Unknown";
+            if (llmReview.error) llmTitle = "AI 审核失败";
+            var llmTitleLabel = {
+                "Blocked": "AI 审查：阻塞",
+                "Pass": "AI 审查：通过",
+                "Pass with notes": "AI 审查：通过（有备注）",
+                "Unknown": "AI 审查：无法判定",
+            };
+
+            html += '<div class="cr-result-card cr-result-card--ai">' +
+                '<div class="cr-result-card__header">' +
+                    '<div class="cr-status-icon cr-status-ai">🤖</div>AI 综合审核（DeepSeek）' +
+                    (llmReview.confidence != null ? '<span class="cr-ai-confidence">置信度: ' + (llmReview.confidence * 100).toFixed(0) + '%</span>' : '') +
+                '</div>' +
+                '<div class="cr-result-card__body">' +
+                    '<div class="cr-conclusion-banner ' + llmBannerClass + '">' +
+                        '<div class="cr-conclusion-banner__title">' + escapeHTML(llmTitleLabel[llmTitle] || llmTitle) + '</div>' +
+                    '</div>' +
+                    (llmReview.summary ? '<div class="cr-ai-summary">' + escapeHTML(llmReview.summary) + '</div>' : '') +
+                    (llmReview.completeness_notes ? '<div class="cr-ai-section"><strong>数据完整性评估：</strong>' + escapeHTML(llmReview.completeness_notes) + '</div>' : '') +
+                    (llmReview.key_risks && llmReview.key_risks.length > 0 ?
+                        '<div class="cr-ai-section"><strong>关键风险：</strong><div class="cr-issue-list">' +
+                        llmReview.key_risks.map(function(r) {
+                            var sevClass = "cr-risk--" + (r.severity || "medium");
+                            return '<div class="cr-issue-item ' + sevClass + '">' +
+                                '<div class="cr-issue-item__icon">!</div>' +
+                                '<div class="cr-issue-item__text"><strong>' + escapeHTML(r.risk) + '</strong>' +
+                                (r.suggestion ? '<br><em>' + escapeHTML(r.suggestion) + '</em>' : '') + '</div>' +
+                            '</div>';
+                        }).join("") + '</div></div>' : "") +
+                    (llmReview.non_blocker_issues && llmReview.non_blocker_issues.length > 0 ?
+                        '<div class="cr-ai-section"><strong>非阻塞备注：</strong><div class="cr-issue-list">' +
+                        llmReview.non_blocker_issues.map(function(i) {
+                            return '<div class="cr-issue-item cr-issue-item--non-blocker">' +
+                                '<div class="cr-issue-item__icon">i</div>' +
+                                '<div class="cr-issue-item__text"><strong>' + escapeHTML(i.issue) + '</strong>' +
+                                (i.note ? '<br><em>' + escapeHTML(i.note) + '</em>' : '') + '</div>' +
+                            '</div>';
+                        }).join("") + '</div></div>' : "") +
+                    (llmReview.next_steps && llmReview.next_steps.length > 0 ?
+                        '<div class="cr-ai-section"><strong>推荐操作：</strong><ul class="cr-next-steps">' +
+                        llmReview.next_steps.map(function(s) { return '<li>' + escapeHTML(s) + '</li>'; }).join("") +
+                        '</ul></div>' : "") +
+                    (llmReview.error ? '<div class="cr-ai-error">' + escapeHTML(llmReview.error) + '</div>' : '') +
+                '</div>' +
+            '</div>';
+        }
+
+        // =============================================
+        // 2. Rule-based Conclusion Banner
+        // =============================================
+        var conclusion = report.conclusion || "Unknown";
+        var bannerClass = "cr-conclusion-banner--blocked";
+        if (conclusion === "Pass") bannerClass = "cr-conclusion-banner--pass";
+        else if (conclusion.indexOf("notes") >= 0 || conclusion.indexOf("Pass") >= 0) bannerClass = "cr-conclusion-banner--warning";
+
+        var conclusionLabels = {
+            "Blocked": "规则审查：阻塞",
+            "Pass": "规则审查：通过",
+            "Pass with notes": "规则审查：通过（有备注）",
+        };
+
+        html += '<div class="cr-result-card">' +
+            '<div class="cr-result-card__header">' +
+                '<div class="cr-status-icon cr-status-blocked">' + (conclusion === "Pass" ? "✓" : "!") + '</div>' +
+                '规则审查结论' +
+            '</div>' +
+            '<div class="cr-result-card__body">' +
+                '<div class="cr-conclusion-banner ' + bannerClass + '">' +
+                    '<div class="cr-conclusion-banner__title">' + escapeHTML(conclusionLabels[conclusion] || conclusion) + '</div>' +
+                    (report.blockers && report.blockers.length > 0 ? '<div class="cr-conclusion-banner__reason">阻塞原因: ' + escapeHTML(report.blockers.map(function(b) { return b.type; }).join("; ")) + '</div>' : "") +
+                '</div>' +
+            '</div>' +
+        '</div>';
+
+        // =============================================
+        // 3. Source Recognition
+        // =============================================
+        var sources = report.source_recognition || {};
+        html += '<div class="cr-result-card">' +
+            '<div class="cr-result-card__header">' +
+                '<div class="cr-status-icon cr-status-info">📄</div>文件识别' +
+            '</div>' +
+            '<div class="cr-result-card__body">' +
+                '<div class="cr-source-list">' +
+                    '<div class="cr-source-item"><span class="cr-source-item__dot cr-source-item__dot--' + (sources.contract && sources.contract.status === "found" ? "found" : "not-found") + '"></span>销售合同: ' + escapeHTML((sources.contract && sources.contract.status) || "未知") + (sources.contract && sources.contract.page_count ? ' (' + sources.contract.page_count + '页)' : '') + '</div>' +
+                    '<div class="cr-source-item"><span class="cr-source-item__dot cr-source-item__dot--' + (sources.cqp && sources.cqp.status === "found" ? "found" : "not-found") + '"></span>报价单 CQP: ' + escapeHTML((sources.cqp && sources.cqp.status) || "未知") + (sources.cqp && sources.cqp.page_count ? ' (' + sources.cqp.page_count + '页)' : '') + '</div>' +
+                    '<div class="cr-source-item"><span class="cr-source-item__dot cr-source-item__dot--' + (sources.ta && (sources.ta.status === "standalone" || sources.ta.status === "embedded") ? "found" : (sources.ta && sources.ta.status === "embedded" ? "embedded" : "not-found")) + '"></span>技术协议 TA: ' + escapeHTML((sources.ta && sources.ta.status) || "未知") + (sources.ta && sources.ta.page_count ? ' (' + sources.ta.page_count + '页)' : '') + '</div>' +
+                '</div>' +
+            '</div>' +
+        '</div>';
+
+        // =============================================
+        // 4. Extracted Data (Raw extraction results from PDFs)
+        // =============================================
+        var extractedData = report.extracted_data || {};
+        if (extractedData.contract || extractedData.cqp || extractedData.ta) {
+            html += '<div class="cr-result-card">' +
+                '<div class="cr-result-card__header">' +
+                    '<div class="cr-status-icon cr-status-info">📋</div>原始提取数据（过程）' +
+                '</div>' +
+                '<div class="cr-result-card__body">';
+
+            // Contract extracted fields
+            if (extractedData.contract && Object.keys(extractedData.contract).length > 0) {
+                html += '<div class="cr-extract-section">' +
+                    '<h4 class="cr-extract-section__title">📄 销售合同 提取字段</h4>' +
+                    '<div class="cr-extract-table-wrap"><table class="cr-extract-table">' +
+                    renderExtractRow("合同编号", extractedData.contract.contract_number) +
+                    renderExtractRow("卖方", extractedData.contract.seller_name) +
+                    renderExtractRow("买方", extractedData.contract.buyer_name) +
+                    renderExtractRow("买方地址", extractedData.contract.buyer_address) +
+                    renderExtractRow("最终用户", extractedData.contract.end_customer_name) +
+                    renderExtractRow("安装地点", extractedData.contract.end_customer_address) +
+                    renderExtractRow("贸易条款", extractedData.contract.incoterm_selection) +
+                    renderExtractRow("交付地点", extractedData.contract.delivery_location) +
+                    renderExtractRow("增值税率", extractedData.contract.vat_rate) +
+                    renderExtractRow("未税金额", extractedData.contract.untaxed_amount) +
+                    renderExtractRow("含税金额", extractedData.contract.tax_included_amount) +
+                    renderExtractRow("总数量", extractedData.contract.total_qty) +
+                    renderExtractRow("销售", extractedData.contract.sales_person) +
+                    renderExtractRow("PM", extractedData.contract.pm) +
+                    renderExtractRobotModels("机器人型号", extractedData.contract.robot_models) +
+                    renderExtractRow("质保条款", extractedData.contract.warranty_clause_5_2 ? (extractedData.contract.warranty_clause_5_2.standard || "") : "") +
+                    '</table></div></div>';
+            }
+
+            // CQP extracted fields
+            if (extractedData.cqp && Object.keys(extractedData.cqp).length > 0) {
+                html += '<div class="cr-extract-section">' +
+                    '<h4 class="cr-extract-section__title">💰 报价单 CQP 提取字段</h4>' +
+                    '<div class="cr-extract-table-wrap"><table class="cr-extract-table">' +
+                    renderExtractRow("CQP编号", extractedData.cqp.cqp_number) +
+                    renderExtractRow("客户名称", extractedData.cqp.customer_name) +
+                    renderExtractRow("客户地址", extractedData.cqp.customer_address) +
+                    renderExtractRow("最终用户", extractedData.cqp.end_user) +
+                    renderExtractRow("交付条款", extractedData.cqp.delivery_term) +
+                    renderExtractRow("交付周期", extractedData.cqp.delivery_time) +
+                    renderExtractRow("付款条款", extractedData.cqp.payment_terms) +
+                    renderExtractRow("质保条款", extractedData.cqp.warranty_terms) +
+                    renderExtractRow("增值税率", extractedData.cqp.vat_rate) +
+                    renderExtractRow("未税总价", extractedData.cqp.untaxed_total) +
+                    renderExtractRow("含税总价", extractedData.cqp.tax_included_total) +
+                    renderExtractCqpModels("机器人型号/价格", extractedData.cqp.robot_models) +
+                    renderExtractRow("质保代码", extractedData.cqp.warranty_codes ? extractedData.cqp.warranty_codes.join(", ") : "") +
+                    '</table></div></div>';
+            }
+
+            // TA extracted fields
+            if (extractedData.ta && Object.keys(extractedData.ta).length > 0) {
+                html += '<div class="cr-extract-section">' +
+                    '<h4 class="cr-extract-section__title">🔧 技术协议 TA 提取字段</h4>' +
+                    '<div class="cr-extract-table-wrap"><table class="cr-extract-table">' +
+                    renderExtractRobotModels("机器人型号", extractedData.ta.robot_models) +
+                    renderExtractRow("质保代码", extractedData.ta.warranty_codes ? extractedData.ta.warranty_codes.join(", ") : "") +
+                    '</table></div></div>';
+            }
+
+            html += '</div></div>';
+        }
+
+        // Incoterm
+        var incoterm = report.incoterm || {};
+        html += '<div class="cr-result-card">' +
+            '<div class="cr-result-card__header">' +
+                '<div class="cr-status-icon cr-status-info">🌐</div>贸易术语判定' +
+            '</div>' +
+            '<div class="cr-result-card__body">' +
+                '<p><strong>结论:</strong> ' + escapeHTML(incoterm.conclusion || "未确定") + '</p>' +
+                '<p><strong>合同证据:</strong> ' + escapeHTML(incoterm.contract_evidence || "无") + '</p>' +
+                '<p><strong>CQP证据:</strong> ' + escapeHTML(incoterm.cqp_evidence || "无") + '</p>' +
+                '<p><strong>一致性:</strong> ' + (incoterm.consistent ? "✓ 一致" : "✗ 不一致") + '</p>' +
+            '</div>' +
+        '</div>';
+
+        // Key Checks Table
+        var keyChecks = report.key_checks || [];
+        if (keyChecks.length > 0) {
+            html += '<div class="cr-result-card">' +
+                '<div class="cr-result-card__header">' +
+                    '<div class="cr-status-icon cr-status-info">✅</div>关键校验项' +
+                '</div>' +
+                '<div class="cr-result-card__body">' +
+                    '<table class="cr-check-table">' +
+                        '<thead><tr><th>校验项</th><th>状态</th><th>详情</th></tr></thead>' +
+                        '<tbody>';
+            keyChecks.forEach(function(check) {
+                var badgeClass = "cr-badge--pass";
+                if (check.status === "MISMATCH") badgeClass = "cr-badge--mismatch";
+                else if (check.status === "WARNING") badgeClass = "cr-badge--warning";
+                html += '<tr>' +
+                    '<td>' + escapeHTML(check.check_name) + '</td>' +
+                    '<td><span class="cr-badge ' + badgeClass + '">' + escapeHTML(check.status) + '</span></td>' +
+                    '<td>' + escapeHTML(check.detail || "") + '</td>' +
+                '</tr>';
+            });
+            html += '</tbody></table></div></div>';
+        }
+
+        // Blockers
+        var blockers = report.blockers || [];
+        if (blockers.length > 0) {
+            html += '<div class="cr-result-card">' +
+                '<div class="cr-result-card__header">' +
+                    '<div class="cr-status-icon cr-status-blocked">🚫</div>BLOCKER 问题 (' + blockers.length + ')' +
+                '</div>' +
+                '<div class="cr-result-card__body"><div class="cr-issue-list">';
+            blockers.forEach(function(b) {
+                html += '<div class="cr-issue-item cr-issue-item--blocker">' +
+                    '<div class="cr-issue-item__icon">!</div>' +
+                    '<div class="cr-issue-item__text"><strong>' + escapeHTML(b.type) + ':</strong> ' + escapeHTML(b.detail || "") + '</div>' +
+                '</div>';
+            });
+            html += '</div></div></div>';
+        }
+
+        // Non-blockers
+        var nonBlockers = report.non_blockers || [];
+        if (nonBlockers.length > 0) {
+            html += '<div class="cr-result-card">' +
+                '<div class="cr-result-card__header">' +
+                    '<div class="cr-status-icon cr-status-warning">⚠</div>非阻塞备注 (' + nonBlockers.length + ')' +
+                '</div>' +
+                '<div class="cr-result-card__body"><div class="cr-issue-list">';
+            nonBlockers.forEach(function(nb) {
+                html += '<div class="cr-issue-item cr-issue-item--non-blocker">' +
+                    '<div class="cr-issue-item__icon">i</div>' +
+                    '<div class="cr-issue-item__text"><strong>' + escapeHTML(nb.type) + ':</strong> ' + escapeHTML(nb.detail || "") + '</div>' +
+                '</div>';
+            });
+            html += '</div></div></div>';
+        }
+
+        // Warranty
+        var warranty = report.warranty || {};
+        html += '<div class="cr-result-card">' +
+            '<div class="cr-result-card__header">' +
+                '<div class="cr-status-icon cr-status-info">🛡</div>质保检查' +
+            '</div>' +
+            '<div class="cr-result-card__body">' +
+                '<p><strong>一致性:</strong> ' + (warranty.consistent ? "✓ 一致" : "✗ 不一致") + '</p>' +
+                '<p>' + escapeHTML(warranty.detail || "") + '</p>' +
+                (warranty.cqp_warranty_codes && warranty.cqp_warranty_codes.length > 0 ?
+                    '<p><strong>CQP质保代码:</strong> ' + escapeHTML(warranty.cqp_warranty_codes.join(", ")) + '</p>' : "") +
+            '</div>' +
+        '</div>';
+
+        // Financial Summary
+        var financial = report.financial || {};
+        if (financial.vat_check) {
+            var vat = financial.vat_check;
+            var untaxed = financial.untaxed_check || {};
+            var taxed = financial.tax_included_check || {};
+            html += '<div class="cr-result-card">' +
+                '<div class="cr-result-card__header">' +
+                    '<div class="cr-status-icon cr-status-info">💰</div>财务校验' +
+                '</div>' +
+                '<div class="cr-result-card__body">' +
+                    '<p><strong>增值税率:</strong> ' + escapeHTML(vat.status) + ' (合同: ' + (vat.contract_vat * 100).toFixed(0) + '%, CQP: ' + (vat.cqp_vat * 100).toFixed(0) + '%)</p>' +
+                    '<p><strong>未税金额:</strong> ' + escapeHTML(untaxed.status) + ' (差异: ¥' + (untaxed.diff || 0).toFixed(2) + ')</p>' +
+                    '<p><strong>含税金额:</strong> ' + escapeHTML(taxed.status) + ' (差异: ¥' + (taxed.diff || 0).toFixed(4) + (taxed.is_rounding ? ', 舍入误差' : "") + ')</p>' +
+                '</div>' +
+            '</div>';
+        }
+
+        // BT09 Draft
+        if (report.bt09_draft) {
+            html += '<div class="cr-result-card">' +
+                '<div class="cr-result-card__header">' +
+                    '<div class="cr-status-icon cr-status-pass">✉</div>BT09 邮件草稿' +
+                '</div>' +
+                '<div class="cr-result-card__body">' +
+                    '<div class="cr-bt09-draft">' + escapeHTML(report.bt09_draft) + '</div>' +
+                '</div>' +
+            '</div>';
+        }
+
+        container.innerHTML = html;
+    }
+
+    function showCRToast(message, tone) {
+        try {
+            // Reuse OrderTracker toast if available
+            var container = document.getElementById("toastContainer");
+            if (!container) return;
+            var toast = document.createElement("div");
+            toast.className = "toast toast--" + (tone || "success");
+            toast.textContent = message;
+            container.appendChild(toast);
+            setTimeout(function() { toast.style.opacity = "0"; toast.style.transform = "translateY(8px)"; }, 2400);
+            setTimeout(function() { if (toast.parentNode) toast.parentNode.removeChild(toast); }, 2900);
+        } catch (e) {}
+    }
+
+    function escapeHTML(str) {
+        return String(str || "")
+            .replace(/\x26/g, "\x26amp;")
+            .replace(/</g, "\x26lt;")
+            .replace(/>/g, "\x26gt;")
+            .replace(/"/g, "\x26quot;")
+            .replace(/'/g, "\x26#039;");
+    }
+
+    function renderExtractRow(label, value) {
+        var display = (value != null && value !== "") ? String(value) : '<span class="cr-extract-na">未提取</span>';
+        if (typeof value === "number") display = value.toLocaleString ? value.toLocaleString() : String(value);
+        return '<tr><td class="cr-extract-label">' + escapeHTML(label) + '</td><td class="cr-extract-value">' + (value != null && value !== "" ? escapeHTML(String(value)) : '<span class="cr-extract-na">未提取</span>') + '</td></tr>';
+    }
+
+    function renderExtractRobotModels(label, models) {
+        if (!models || !Array.isArray(models) || models.length === 0) {
+            return '<tr><td class="cr-extract-label">' + escapeHTML(label) + '</td><td class="cr-extract-value"><span class="cr-extract-na">未提取</span></td></tr>';
+        }
+        var parts = models.map(function(m) {
+            return escapeHTML(m.model || "?") + ' ×' + (m.qty || 1);
+        });
+        return '<tr><td class="cr-extract-label">' + escapeHTML(label) + '</td><td class="cr-extract-value">' + parts.join("; ") + '</td></tr>';
+    }
+
+    function renderExtractCqpModels(label, models) {
+        if (!models || !Array.isArray(models) || models.length === 0) {
+            return '<tr><td class="cr-extract-label">' + escapeHTML(label) + '</td><td class="cr-extract-value"><span class="cr-extract-na">未提取</span></td></tr>';
+        }
+        var parts = models.map(function(m) {
+            var s = escapeHTML(m.model || "?") + ' ×' + (m.qty || 1);
+            if (m.unit_price) s += ' @¥' + m.unit_price;
+            if (m.total_price) s += ' (=¥' + m.total_price + ')';
+            return s;
+        });
+        return '<tr><td class="cr-extract-label">' + escapeHTML(label) + '</td><td class="cr-extract-value">' + parts.join("; ") + '</td></tr>';
+    }
+}

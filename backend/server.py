@@ -13,8 +13,10 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import re
 import subprocess
 import sys
+import tempfile
 import threading
 import uuid
 import webbrowser
@@ -32,6 +34,7 @@ if BACKEND_DIR not in sys.path:
 
 from services import project_db  # noqa: E402
 from services.outlook_sync import SyncCancelled, default_date_range, sync_outlook  # noqa: E402
+from services.contract_review import run_review  # noqa: E402
 
 project_db.init_db()
 
@@ -293,6 +296,10 @@ class PMRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         try:
+            if path == "/api/contract-review":
+                result = handle_contract_review(self)
+                self.send_json(result)
+                return
             payload = self.read_json()
             if path == "/api/projects":
                 payload["manualOverride"] = True
@@ -422,6 +429,140 @@ class PMRequestHandler(BaseHTTPRequestHandler):
             data = fh.read()
         self._send_headers(status=200, content_type=content_type)
         self.wfile.write(data)
+
+
+def handle_contract_review(handler: PMRequestHandler) -> Dict[str, Any]:
+    """Handle contract review API: accept PDF file uploads via multipart form data."""
+    content_type = handler.headers.get("Content-Type", "")
+    temp_dir = None
+    try:
+        if "multipart/form-data" in content_type:
+            # Parse multipart form data with named fields
+            pdf_paths, file_roles, temp_dir = _parse_multipart_upload(handler)
+        else:
+            # Try JSON with file paths
+            payload = handler.read_json()
+            pdf_paths = payload.get("pdf_paths") or payload.get("paths") or []
+            file_roles = payload.get("file_roles") or None
+            if isinstance(pdf_paths, str):
+                pdf_paths = [pdf_paths]
+
+        if not pdf_paths:
+            raise ValueError("请上传至少一个PDF文件（Contract 和 CQP）")
+
+        # Validate paths exist
+        for p in pdf_paths:
+            if not os.path.exists(p):
+                raise FileNotFoundError(f"文件不存在: {p}")
+
+        # Run review with explicit file roles
+        result = run_review(pdf_paths, file_roles=file_roles)
+        result["ok"] = True
+        return result
+    finally:
+        pass  # Temp dir cleanup is handled by the caller's finally or OS reclaim
+
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB limit
+PDF_SIGNATURE = b"%PDF-"
+
+
+def _validate_pdf_data(data: bytes, filename: str) -> bytes:
+    """Validate that uploaded data is a PDF file."""
+    if len(data) > MAX_FILE_SIZE:
+        raise ValueError(f"文件 {filename} 超过大小限制（50 MB）")
+    if not data.startswith(PDF_SIGNATURE):
+        raise ValueError(f"文件 {filename} 不是有效的 PDF 文件（缺少 PDF 文件头）")
+    return data
+
+
+def _parse_multipart_upload(handler: PMRequestHandler) -> Tuple[List[str], Dict[str, str], str]:
+    """Parse multipart form data with named fields.
+
+    Returns: (all_paths, file_roles, temp_dir)
+      - all_paths: list of all saved file paths
+      - file_roles: dict mapping role names (contract/cqp/ta) to file paths
+      - temp_dir: temp directory for cleanup
+    """
+    content_type = handler.headers.get("Content-Type", "")
+    # Extract boundary
+    boundary_match = re.search(r"boundary=(.+)", content_type)
+    if not boundary_match:
+        raise ValueError("无法解析 multipart boundary")
+
+    boundary = boundary_match.group(1).strip()
+    if boundary.startswith('"') and boundary.endswith('"'):
+        boundary = boundary[1:-1]
+
+    # Read body
+    length = int(handler.headers.get("Content-Length", "0") or 0)
+    if length <= 0:
+        raise ValueError("请求体为空")
+
+    raw = handler.rfile.read(length)
+    boundary_bytes = ("--" + boundary).encode("utf-8")
+
+    # Create temp directory
+    temp_dir = tempfile.mkdtemp(prefix="cr_upload_")
+    saved_paths: List[str] = []
+    file_roles: Dict[str, str] = {}
+
+    # Known field names for file roles
+    ROLE_FIELDS = {"contract", "cqp", "ta"}
+
+    # Split by boundary
+    parts = raw.split(boundary_bytes)
+    for part in parts:
+        if b"Content-Disposition" not in part:
+            continue
+
+        # Extract field name
+        name_match = re.search(rb'name="(.+?)"', part)
+        field_name = name_match.group(1).decode("utf-8", errors="replace") if name_match else ""
+
+        # Extract filename
+        filename_match = re.search(rb'filename="(.+?)"', part)
+        if not filename_match:
+            continue
+
+        filename = filename_match.group(1).decode("utf-8", errors="replace")
+        filename = os.path.basename(filename)  # safety
+
+        # Find end of headers
+        header_end = part.find(b"\r\n\r\n")
+        if header_end < 0:
+            # Try single newline separation
+            header_end = part.find(b"\n\n")
+            if header_end < 0:
+                continue
+
+        file_data = part[header_end + 4:]
+        if header_end > 0 and part[header_end:header_end + 4] != b"\r\n\r\n":
+            file_data = part[header_end + 2:]
+
+        # Trim trailing \r\n and boundary markers
+        file_data = file_data.rstrip(b"\r\n")
+        if file_data.endswith(b"--"):
+            file_data = file_data[:-2].rstrip(b"\r\n")
+
+        if not file_data:
+            continue
+
+        # Validate PDF
+        file_data = _validate_pdf_data(file_data, filename)
+
+        filepath = os.path.join(temp_dir, filename)
+        with open(filepath, "wb") as f:
+            f.write(file_data)
+        saved_paths.append(filepath)
+
+        # Assign to role if field name matches
+        if field_name in ROLE_FIELDS:
+            if field_name in file_roles:
+                # Another file already uploaded for this role — use the latest one
+                pass
+            file_roles[field_name] = filepath
+
+    return saved_paths, file_roles, temp_dir
 
 
 def main() -> None:
