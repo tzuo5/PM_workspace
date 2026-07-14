@@ -32,8 +32,6 @@ if BACKEND_DIR not in sys.path:
 
 from services import project_db  # noqa: E402
 from services.outlook_sync import SyncCancelled, default_date_range, sync_outlook  # noqa: E402
-from services import document_check_db as dcdb  # noqa: E402
-from services import document_check_service as dcsvc  # noqa: E402
 
 project_db.init_db()
 
@@ -54,6 +52,12 @@ def job_log(job_id: str, message: str) -> None:
 
 
 def run_sync_job(job_id: str, payload: Dict[str, Any]) -> None:
+    """Run one Outlook sync job in a background thread.
+
+    Outlook automation uses Windows COM. COM initialization is thread-local, so
+    the worker thread must call pythoncom.CoInitialize() before touching Outlook.
+    Without this, pywin32 raises: "CoInitialize has not been called."
+    """
     with SYNC_LOCK:
         SYNC_JOBS[job_id].update({"status": "running", "startedAt": now_text(), "updatedAt": now_text()})
 
@@ -65,6 +69,7 @@ def run_sync_job(job_id: str, payload: Dict[str, Any]) -> None:
             pythoncom.CoInitialize()
             job_log(job_id, "Windows COM 初始化完成。")
         except ImportError:
+            # sync_outlook/connect_outlook will raise the user-facing pywin32 message.
             pythoncom = None
 
         cancel_event = SYNC_CANCEL_EVENTS.get(job_id)
@@ -125,6 +130,13 @@ def safe_static_path(path: str) -> Optional[str]:
 
 
 def open_email_in_outlook(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Open the source Outlook MailItem in the classic Outlook client.
+
+    The front end sends either latestEmailEntryId/latestEmailStoreId directly or
+    a project id/contract. For older synced rows that do not yet have the
+    latestEmailEntryId columns, we fall back to the latest stored email record
+    for that contract.
+    """
     entry_id = str(payload.get("entry_id") or payload.get("entryId") or "").strip()
     store_id = str(payload.get("store_id") or payload.get("storeId") or "").strip()
     contract = str(payload.get("contract") or "").strip()
@@ -157,6 +169,7 @@ def open_email_in_outlook(payload: Dict[str, Any]) -> Dict[str, Any]:
         try:
             item = namespace.GetItemFromID(entry_id, store_id) if store_id else namespace.GetItemFromID(entry_id)
         except Exception:
+            # Some Outlook profiles resolve the item only without StoreID.
             item = namespace.GetItemFromID(entry_id)
         item.Display(False)
         return {"ok": True, "message": "已在 Outlook 中打开原始邮件。"}
@@ -171,6 +184,12 @@ def open_email_in_outlook(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def open_attachment_file(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Open one saved Outlook attachment with the local OS default app.
+
+    The front end passes a database attachment id, not an arbitrary filesystem
+    path.  The backend then checks the row belongs to the current project and
+    that the file still exists before opening it.
+    """
     attachment_id = payload.get("attachmentId") or payload.get("attachment_id") or payload.get("id")
     project_id = str(payload.get("projectId") or payload.get("project_id") or "").strip()
     attachment = project_db.get_attachment(attachment_id)
@@ -198,6 +217,7 @@ class PMRequestHandler(BaseHTTPRequestHandler):
     server_version = "PMWorkplace/1.0"
 
     def log_message(self, fmt: str, *args: Any) -> None:
+        # Keep terminal output focused; uncomment for request debugging.
         return
 
     def _send_headers(self, status: int = 200, content_type: str = "application/json; charset=utf-8") -> None:
@@ -221,32 +241,6 @@ class PMRequestHandler(BaseHTTPRequestHandler):
             return {}
         raw = self.rfile.read(length).decode("utf-8")
         return json.loads(raw) if raw else {}
-
-    def _parse_multipart(self, boundary: str) -> Tuple[bytes, str]:
-        """Simple multipart form-data parser for file uploads."""
-        content_length = int(self.headers.get("Content-Length", "0") or 0)
-        raw = self.rfile.read(content_length)
-        boundary_bytes = boundary.encode("utf-8")
-        parts = raw.split(b"--" + boundary_bytes)
-
-        file_content = b""
-        filename = "upload.pdf"
-        for part in parts:
-            if b"Content-Disposition" in part and b"filename=" in part:
-                import re as _re
-                header, content = part.split(b"\r\n\r\n", 1)
-                header_str = header.decode("utf-8", errors="replace")
-                for line in header_str.split("\r\n"):
-                    if "filename=" in line:
-                        match = _re.search(r'filename="([^"]*)"', line)
-                        if match:
-                            filename = match.group(1)
-                        break
-                content = content.rsplit(b"\r\n--", 1)[0]
-                content = content.rstrip(b"\r\n")
-                file_content = content
-                break
-        return file_content, filename
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         self._send_headers(status=HTTPStatus.NO_CONTENT)
@@ -288,94 +282,6 @@ class PMRequestHandler(BaseHTTPRequestHandler):
                         return
                     self.send_json({"ok": True, "job": job})
                 return
-
-            # Document Check GET endpoints
-            if path == "/api/document-check/cases":
-                cases = dcdb.list_review_cases()
-                self.send_json({"ok": True, "cases": cases})
-                return
-
-            if path.startswith("/api/document-check/cases/") and path.endswith("/status"):
-                parts = [p for p in path.strip("/").split("/") if p]
-                case_id = parts[3] if len(parts) >= 4 else ""
-                status = dcsvc.get_review_job_status(case_id) if case_id else {"status": "unknown"}
-                self.send_json({"ok": True, "status": status})
-                return
-
-            if path.startswith("/api/document-check/cases/") and path.endswith("/results"):
-                parts = [p for p in path.strip("/").split("/") if p]
-                case_id = parts[3] if len(parts) >= 4 else ""
-                if not case_id:
-                    self.send_error_json("缺少 case ID。", status=400)
-                    return
-                case = dcdb.get_review_case(case_id)
-                docs = dcdb.list_review_documents(case_id)
-                fields = dcdb.list_extracted_fields(case_id)
-                items = dcdb.list_check_items(case_id)
-                # Resolve evidence data for each check item
-                all_ev_ids = []
-                for item in items:
-                    for ev_id in (item.get("evidence_refs") or []):
-                        if ev_id not in all_ev_ids:
-                            all_ev_ids.append(ev_id)
-                evidence_map = {}
-                if all_ev_ids:
-                    ev_rows = dcdb.get_evidence_by_ids(all_ev_ids)
-                    for ev in ev_rows:
-                        evidence_map[ev["id"]] = ev
-                self.send_json({"ok": True, "case": case, "documents": docs,
-                                "extracted_fields": fields, "check_items": items,
-                                "evidence": evidence_map})
-                return
-
-            if path.startswith("/api/document-check/cases/") and path.count("/") == 4:
-                parts = [p for p in path.strip("/").split("/") if p]
-                case_id = parts[3] if len(parts) >= 4 else ""
-                if not case_id:
-                    self.send_error_json("缺少 case ID。", status=400)
-                    return
-                case = dcdb.get_review_case(case_id)
-                if not case:
-                    self.send_error_json("Case 不存在。", status=404)
-                    return
-                docs = dcdb.list_review_documents(case_id)
-                self.send_json({"ok": True, "case": case, "documents": docs})
-                return
-
-            if path.startswith("/api/document-check/documents/") and path.endswith("/file"):
-                parts = [p for p in path.strip("/").split("/") if p]
-                doc_id = parts[3] if len(parts) >= 4 else ""
-                if not doc_id:
-                    self.send_error_json("缺少 document ID。", status=400)
-                    return
-                doc = dcdb.get_review_document(doc_id)
-                if not doc:
-                    self.send_error_json("文档不存在。", status=404)
-                    return
-                dc_dir = os.path.join(BACKEND_DIR, "data", "attachments", "document_check")
-                filepath = os.path.join(dc_dir, doc.get("stored_filename", ""))
-                if not os.path.isfile(filepath):
-                    self.send_error_json("文件不存在于磁盘。", status=404)
-                    return
-                with open(filepath, "rb") as fh:
-                    data = fh.read()
-                self._send_headers(status=200, content_type="application/pdf")
-                self.wfile.write(data)
-                return
-
-            if path.startswith("/api/document-check/documents/") and path.count("/") == 4:
-                parts = [p for p in path.strip("/").split("/") if p]
-                doc_id = parts[3] if len(parts) >= 4 else ""
-                if not doc_id:
-                    self.send_error_json("缺少 document ID。", status=400)
-                    return
-                doc = dcdb.get_review_document(doc_id)
-                if not doc:
-                    self.send_error_json("文档不存在。", status=404)
-                    return
-                self.send_json({"ok": True, "document": doc})
-                return
-
             if path.startswith("/api/"):
                 self.send_error_json("未知 API。", status=404)
                 return
@@ -462,122 +368,6 @@ class PMRequestHandler(BaseHTTPRequestHandler):
                 thread.start()
                 self.send_json({"ok": True, "jobId": job_id})
                 return
-
-            # ===================================================
-            # DOCUMENT CHECK POST API
-            # ===================================================
-
-            if path == "/api/document-check/cases":
-                case = dcdb.create_review_case(payload.get("name", ""))
-                self.send_json({"ok": True, "case": case})
-                return
-
-            if path.startswith("/api/document-check/cases/") and path.endswith("/documents"):
-                parts = [p for p in path.strip("/").split("/") if p]
-                case_id = parts[3] if len(parts) >= 4 else ""
-                if not case_id:
-                    self.send_error_json("缺少 case ID。", status=400)
-                    return
-                content_type = self.headers.get("Content-Type", "")
-                if "multipart/form-data" in content_type:
-                    boundary = content_type.split("boundary=")[-1].strip()
-                    file_content, filename = self._parse_multipart(boundary)
-                    if not file_content:
-                        self.send_error_json("未收到文件。", status=400)
-                        return
-                else:
-                    file_b64 = payload.get("file_content", "")
-                    filename = payload.get("original_filename", "upload.pdf")
-                    import base64
-                    try:
-                        file_content = base64.b64decode(file_b64)
-                    except Exception:
-                        self.send_error_json("文件内容解码失败。", status=400)
-                        return
-
-                workspace = payload.get("workspace", "A")
-                try:
-                    doc = dcsvc.process_upload(case_id, file_content, filename, workspace)
-                    self.send_json({"ok": True, "document": doc})
-                except ValueError as ve:
-                    self.send_error_json(str(ve), status=400)
-                return
-
-            if path.startswith("/api/document-check/cases/") and path.endswith("/run"):
-                parts = [p for p in path.strip("/").split("/") if p]
-                case_id = parts[3] if len(parts) >= 4 else ""
-                if not case_id:
-                    self.send_error_json("缺少 case ID。", status=400)
-                    return
-                dcsvc.start_review_job(case_id)
-                self.send_json({"ok": True, "case_id": case_id, "status": "running"})
-                return
-
-            if path.startswith("/api/document-check/cases/") and path.endswith("/generate-bt09"):
-                parts = [p for p in path.strip("/").split("/") if p]
-                case_id = parts[3] if len(parts) >= 4 else ""
-                if not case_id:
-                    self.send_error_json("缺少 case ID。", status=400)
-                    return
-                try:
-                    bt09 = dcsvc.generate_bt09_draft(case_id)
-                    self.send_json({"ok": True, "bt09": bt09})
-                except ValueError as ve:
-                    self.send_error_json(str(ve), status=400)
-                return
-
-            if path.startswith("/api/document-check/cases/") and path.count("/") == 4:
-                parts = [p for p in path.strip("/").split("/") if p]
-                case_id = parts[3] if len(parts) >= 4 else ""
-                if not case_id:
-                    self.send_error_json("缺少 case ID。", status=400)
-                    return
-                if self.command == "DELETE":
-                    dcdb.delete_review_case(case_id)
-                    self.send_json({"ok": True})
-                    return
-                self.send_error_json("Method not supported。", status=405)
-                return
-
-            if path.startswith("/api/document-check/documents/") and path.count("/") == 4:
-                parts = [p for p in path.strip("/").split("/") if p]
-                doc_id = parts[3] if len(parts) >= 4 else ""
-                if not doc_id:
-                    self.send_error_json("缺少 document ID。", status=400)
-                    return
-                if self.command == "DELETE":
-                    dcdb.delete_review_document(doc_id)
-                    self.send_json({"ok": True})
-                    return
-                self.send_error_json("Method not supported。", status=405)
-                return
-
-            if path.startswith("/api/document-check/check-items/") and path.count("/") == 5:
-                parts = [p for p in path.strip("/").split("/") if p]
-                item_id = parts[4] if len(parts) >= 5 else ""
-                if not item_id:
-                    self.send_error_json("缺少 check item ID。", status=400)
-                    return
-                status_val = payload.get("status", "")
-                summary = payload.get("summary", "")
-                details = payload.get("details", "")
-                item = dcdb.update_check_item_status(item_id, status_val, summary, details)
-                self.send_json({"ok": True, "check_item": item})
-                return
-
-            if path.startswith("/api/document-check/fields/") and path.count("/") == 5:
-                parts = [p for p in path.strip("/").split("/") if p]
-                field_id = parts[4] if len(parts) >= 5 else ""
-                if not field_id:
-                    self.send_error_json("缺少 field ID。", status=400)
-                    return
-                new_value = payload.get("value", "")
-                note = payload.get("note", "")
-                source = payload.get("source", "manual")
-                field = dcdb.apply_manual_override(field_id, new_value, note, source)
-                self.send_json({"ok": True, "field": field})
-                return
-
             self.send_error_json("未知 API。", status=404)
         except Exception as exc:
             self.send_error_json(str(exc), status=500)

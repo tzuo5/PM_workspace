@@ -713,8 +713,6 @@ var OrderTracker = (function() {
         var title = detail.title || "该模块";
         if (section === "tracker") {
             this.showTrackerPage();
-        } else if (section === "document-check") {
-            this.showDocumentCheckPage();
         } else {
             this.showUnderDevelopmentPage(title);
         }
@@ -722,20 +720,9 @@ var OrderTracker = (function() {
 
     OrderTracker.prototype.showTrackerPage = function() {
         var tracker = this.getEl("trackerContent");
-        var dc = this.getEl("documentCheckContent");
         var underDevelopment = this.getEl("underDevelopment");
         if (tracker) tracker.hidden = false;
-        if (dc) dc.hidden = true;
         if (underDevelopment) underDevelopment.hidden = true;
-    };
-
-    OrderTracker.prototype.showDocumentCheckPage = function() {
-        var tracker = this.getEl("trackerContent");
-        var dc = this.getEl("documentCheckContent");
-        var underDev = this.getEl("underDevelopment");
-        if (tracker) tracker.hidden = true;
-        if (underDev) underDev.hidden = true;
-        if (dc) dc.hidden = false;
     };
 
     OrderTracker.prototype.showUnderDevelopmentPage = function(sectionTitle) {

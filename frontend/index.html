@@ -5,7 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PM Workplace | ABB</title>
     <link rel="stylesheet" href="css/main.css">
-    <link rel="stylesheet" href="css/document-check.css">
     <script>
         (function() {
             try {
@@ -88,15 +87,6 @@
                     </svg>
                     <span class="nav-label">统计</span>
                 </a>
-                <a href="#" class="nav-item" data-section="document-check">
-                    <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>
-                        <polyline points="14,2 14,8 20,8"/>
-                        <line x1="12" y1="18" x2="12" y2="12"/>
-                        <line x1="9" y1="15" x2="15" y2="15"/>
-                    </svg>
-                    <span class="nav-label">Document Check</span>
-                </a>
                 <div class="nav-divider"></div>
                 <a href="#" class="nav-item" data-section="settings">
                     <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -135,142 +125,119 @@
                             同步 Outlook
                         </button>
                         <button class="btn btn--outline" id="btnExportExcel">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+                                <polyline points="7,10 12,15 17,10"/>
+                                <line x1="12" y1="15" x2="12" y2="3"/>
+                            </svg>
                             Export Excel
                         </button>
                         <button class="btn btn--primary" id="btnAddOrder">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                                <line x1="12" y1="5" x2="12" y2="19"/>
+                                <line x1="5" y1="12" x2="19" y2="12"/>
+                            </svg>
                             新增项目
                         </button>
                     </div>
                 </div>
+
                 <div class="tracker-toolbar">
                     <div class="tracker-toolbar__left">
                         <div class="toolbar-search">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                                <circle cx="11" cy="11" r="8"/>
+                                <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                            </svg>
                             <input type="text" placeholder="搜索项目编号或客户..." id="searchOrders">
                         </div>
-                        <button class="btn btn--ghost" id="btnUndo" type="button" disabled>返回</button>
+                        <button class="btn btn--ghost" id="btnArchiveAll">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                                <polyline points="21,8 21,21 3,21 3,8"/>
+                                <rect x="1" y="3" width="22" height="5"/>
+                                <line x1="10" y1="12" x2="14" y2="12"/>
+                            </svg>
+                            <span id="btnArchiveAllText">归档全部</span>
+                        </button>
+                        <button class="btn btn--ghost btn--danger-lite" id="btnDeleteAll" type="button">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                                <polyline points="3,6 5,6 21,6"/>
+                                <path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/>
+                                <path d="M10 11v6M14 11v6M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2"/>
+                            </svg>
+                            删除全部
+                        </button>
+                        <button class="btn btn--ghost" id="btnUndo" type="button" disabled>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                                <path d="M9 14L4 9l5-5"/>
+                                <path d="M4 9h10a6 6 0 010 12h-1"/>
+                            </svg>
+                            返回
+                        </button>
                     </div>
                     <div class="tracker-toolbar__right">
                         <div class="visible-columns-wrapper">
                             <button class="btn btn--ghost" id="btnVisibleColumns">
                                 显示列 (<span id="visibleCount">7</span>)
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+                                    <polyline points="6,9 12,15 18,9"/>
+                                </svg>
                             </button>
                             <div class="visible-columns-dropdown" id="columnsDropdown">
-                                <label class="column-checkbox"><input type="checkbox" checked data-column="sales-contract"> 销售开启合同</label>
-                                <label class="column-checkbox"><input type="checkbox" checked data-column="pm-bt09"> PM开启BT09</label>
-                                <label class="column-checkbox"><input type="checkbox" checked data-column="pa-so-bt09"> PA回复SO/BT09</label>
-                                <label class="column-checkbox"><input type="checkbox" checked data-column="iprocess"> iProcess审批</label>
-                                <label class="column-checkbox"><input type="checkbox" checked data-column="book-order"> Book订单申请</label>
-                                <label class="column-checkbox"><input type="checkbox" checked data-column="factory-bt"> 工厂BT回复</label>
-                                <label class="column-checkbox"><input type="checkbox" checked data-column="factory-oa"> 工厂反馈OA</label>
+                                <label class="column-checkbox">
+                                    <input type="checkbox" checked data-column="sales-contract"> 销售开启合同
+                                    <span class="column-count" id="count-sales-contract">0</span>
+                                </label>
+                                <label class="column-checkbox">
+                                    <input type="checkbox" checked data-column="pm-bt09"> PM开启BT09
+                                    <span class="column-count" id="count-pm-bt09">0</span>
+                                </label>
+                                <label class="column-checkbox">
+                                    <input type="checkbox" checked data-column="pa-so-bt09"> PA回复SO/BT09
+                                    <span class="column-count" id="count-pa-so-bt09">0</span>
+                                </label>
+                                <label class="column-checkbox">
+                                    <input type="checkbox" checked data-column="iprocess"> iProcess审批
+                                    <span class="column-count" id="count-iprocess">0</span>
+                                </label>
+                                <label class="column-checkbox">
+                                    <input type="checkbox" checked data-column="book-order"> Book订单申请
+                                    <span class="column-count" id="count-book-order">0</span>
+                                </label>
+                                <label class="column-checkbox">
+                                    <input type="checkbox" checked data-column="factory-bt"> 工厂BT回复
+                                    <span class="column-count" id="count-factory-bt">0</span>
+                                </label>
+                                <label class="column-checkbox">
+                                    <input type="checkbox" checked data-column="factory-oa"> 工厂反馈OA
+                                    <span class="column-count" id="count-factory-oa">0</span>
+                                </label>
                             </div>
+                        </div>
+                        <div class="view-toggle">
+                            <button class="view-btn active" data-view="columns" title="列视图">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                                    <rect x="3" y="3" width="7" height="18" rx="1"/>
+                                    <rect x="14" y="3" width="7" height="18" rx="1"/>
+                                </svg>
+                                <span>列视图</span>
+                            </button>
+                            <button class="view-btn" data-view="list" title="列表视图">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                                    <line x1="8" y1="6" x2="21" y2="6"/>
+                                    <line x1="8" y1="12" x2="21" y2="12"/>
+                                    <line x1="8" y1="18" x2="21" y2="18"/>
+                                    <line x1="3" y1="6" x2="3.01" y2="6"/>
+                                    <line x1="3" y1="12" x2="3.01" y2="12"/>
+                                    <line x1="3" y1="18" x2="3.01" y2="18"/>
+                                </svg>
+                                <span>列表</span>
+                            </button>
                         </div>
                     </div>
                 </div>
+
                 <div class="kanban-board" id="kanbanBoard"></div>
-            </div>
-
-            <!-- DOCUMENT CHECK PAGE -->
-            <div id="documentCheckContent" hidden>
-                <div class="dc-topbar">
-                    <div class="dc-topbar__left">
-                        <h1 class="dc-topbar__title">Document Check</h1>
-                        <span class="dc-case-info" id="dcCaseInfo">No case loaded</span>
-                    </div>
-                    <div class="dc-topbar__right">
-                        <button class="btn btn--primary" id="btnNewCase">New Case</button>
-                        <button class="btn btn--outline" id="btnRunReview" disabled>Run Review</button>
-                        <button class="btn btn--outline" id="btnCopyBT09" disabled>Copy BT09</button>
-                        <span class="dc-status-badge" id="dcStatusBadge">No files</span>
-                    </div>
-                </div>
-                <div class="dc-main" id="dcMain">
-                    <!-- Workspace A -->
-                    <div class="dc-workspace" id="workspaceA">
-                        <div class="dc-ws-header">
-                            <h2>Workspace A</h2>
-                            <span class="dc-ws-hint">Contract / TA</span>
-                        </div>
-                        <div class="dc-ws-upload" id="wsAUpload">
-                            <div class="dc-upload-zone" id="wsAUploadZone">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="32" height="32"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17,8 12,3 7,8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                                <p>Drop PDF here or click to upload</p>
-                            </div>
-                            <input type="file" id="wsAFileInput" accept=".pdf" multiple hidden>
-                            <div class="dc-file-tabs" id="wsATabs"></div>
-                        </div>
-                        <div class="dc-pdf-viewer" id="wsAViewer" hidden>
-                            <div class="dc-pdf-toolbar">
-                                <button class="btn btn--ghost" id="wsAPrev">◀</button>
-                                <input type="number" class="dc-page-input" id="wsAPageInput" value="1" min="1">
-                                <span>/</span><span id="wsAPageTotal">1</span>
-                                <button class="btn btn--ghost" id="wsANext">▶</button>
-                                <div class="dc-zoom">
-                                    <button class="btn btn--ghost" id="wsAZoomOut">−</button>
-                                    <span id="wsAZoomLabel">100%</span>
-                                    <button class="btn btn--ghost" id="wsAZoomIn">+</button>
-                                    <button class="btn btn--ghost" id="wsAFitWidth">↔</button>
-                                </div>
-                            </div>
-                            <div class="dc-canvas-wrapper" id="wsACanvasWrapper">
-                                <canvas id="wsACanvas"></canvas>
-                                <div class="dc-overlay" id="wsAOverlay"></div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Resizer -->
-                    <div class="dc-resizer" id="dcResizer1"></div>
-
-                    <!-- Workspace B -->
-                    <div class="dc-workspace" id="workspaceB">
-                        <div class="dc-ws-header">
-                            <h2>Workspace B</h2>
-                            <span class="dc-ws-hint">CQP / TA</span>
-                        </div>
-                        <div class="dc-ws-upload" id="wsBUpload">
-                            <div class="dc-upload-zone" id="wsBUploadZone">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="32" height="32"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17,8 12,3 7,8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                                <p>Drop PDF here or click to upload</p>
-                            </div>
-                            <input type="file" id="wsBFileInput" accept=".pdf" multiple hidden>
-                            <div class="dc-file-tabs" id="wsBTabs"></div>
-                        </div>
-                        <div class="dc-pdf-viewer" id="wsBViewer" hidden>
-                            <div class="dc-pdf-toolbar">
-                                <button class="btn btn--ghost" id="wsBPrev">◀</button>
-                                <input type="number" class="dc-page-input" id="wsBPageInput" value="1" min="1">
-                                <span>/</span><span id="wsBPageTotal">1</span>
-                                <button class="btn btn--ghost" id="wsBNext">▶</button>
-                                <div class="dc-zoom">
-                                    <button class="btn btn--ghost" id="wsBZoomOut">−</button>
-                                    <span id="wsBZoomLabel">100%</span>
-                                    <button class="btn btn--ghost" id="wsBZoomIn">+</button>
-                                    <button class="btn btn--ghost" id="wsBFitWidth">↔</button>
-                                </div>
-                            </div>
-                            <div class="dc-canvas-wrapper" id="wsBCanvasWrapper">
-                                <canvas id="wsBCanvas"></canvas>
-                                <div class="dc-overlay" id="wsBOverlay"></div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Resizer -->
-                    <div class="dc-resizer" id="dcResizer2"></div>
-
-                    <!-- Result Panel -->
-                    <div class="dc-result-panel" id="dcResultPanel">
-                        <div class="dc-result-header">
-                            <h2>Review Results</h2>
-                            <div class="dc-conclusion" id="dcConclusion">-</div>
-                        </div>
-                        <div class="dc-result-body" id="dcResultBody">
-                            <div class="dc-result-empty">
-                                <p>Upload documents and run review to see results.</p>
-                            </div>
-                        </div>
-                    </div>
-                </div>
             </div>
 
             <section class="under-development" id="underDevelopment" hidden>
@@ -278,74 +245,228 @@
                     <div class="under-development__stripe"></div>
                     <div class="under-development__eyebrow">ABB PM Workplace</div>
                     <h1 class="under-development__title" id="underDevelopmentTitle">正在开发中</h1>
-                    <p class="under-development__desc" id="underDevelopmentDesc">该模块尚未接入正式业务逻辑。当前版本优先开放"项目跟踪"，其他模块会在后续迭代中补齐。</p>
+                    <p class="under-development__desc" id="underDevelopmentDesc">
+                        该模块尚未接入正式业务逻辑。当前版本优先开放“项目跟踪”，其他模块会在后续迭代中补齐。
+                    </p>
                     <button class="btn btn--primary" id="btnBackToTracker" type="button">返回项目跟踪</button>
                 </div>
             </section>
         </main>
     </div>
 
-    <!-- Modals -->
     <div class="modal-overlay" id="modalOverlay">
         <div class="modal" id="addOrderModal">
-            <div class="modal__header"><div class="modal__title"><span id="modalTitleText">新增项目</span></div><button class="modal__close" id="modalClose">&times;</button></div>
-            <div class="modal__body">
-                <div class="form-group"><label class="form-label">项目名称描述</label><input type="text" class="form-input" id="orderName"></div>
-                <div class="form-group"><label class="form-label">客户名称</label><input type="text" class="form-input" id="orderClient"></div>
-                <div class="form-row"><div class="form-group"><label class="form-label">项目金额</label><input type="text" class="form-input" id="orderAmount"></div><div class="form-group"><label class="form-label">项目类型</label><select class="form-select" id="orderType"><option value="standard">标准</option><option value="urgent">加急</option></select></div></div>
-                <div class="form-group"><label class="form-label">项目编号</label><input type="text" class="form-input" id="orderContract"></div>
-                <div class="form-group"><label class="form-label">当前阶段</label><select class="form-select" id="orderStatus"><option value="sales-contract">销售开启合同</option><option value="pm-bt09">PM开启BT09</option><option value="pa-so-bt09">PA回复SO/BT09</option><option value="iprocess">iProcess审批</option><option value="book-order">Book订单申请</option><option value="factory-bt">工厂BT回复</option><option value="factory-oa">工厂反馈OA</option></select></div>
+            <div class="modal__header">
+                <div class="modal__title">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
+                        <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>
+                        <polyline points="14,2 14,8 20,8"/>
+                    </svg>
+                    <span id="modalTitleText">新增项目</span>
+                </div>
+                <button class="modal__close" id="modalClose" aria-label="关闭">&times;</button>
+                <input type="hidden" id="editingOrderId" value="">
             </div>
-            <div class="modal__footer"><button class="btn btn--ghost" id="btnCancelOrder">取消</button><button class="btn btn--primary" id="btnConfirmOrder">添加</button></div>
+            <div class="modal__body">
+                <div class="form-group">
+                    <label class="form-label">项目名称描述 <span class="required">*</span></label>
+                    <input type="text" class="form-input" id="orderName" placeholder="输入项目名称或描述，例如 REF615保护继电器">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">客户名称 <span class="required">*</span></label>
+                    <input type="text" class="form-input" id="orderClient" placeholder="客户/公司名称">
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label">项目金额</label>
+                        <input type="text" class="form-input" id="orderAmount" placeholder="0.00">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">项目类型</label>
+                        <select class="form-select" id="orderType">
+                            <option value="standard">标准项目</option>
+                            <option value="urgent">加急项目</option>
+                            <option value="custom">定制项目</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label">项目编号</label>
+                        <input type="text" class="form-input" id="orderContract" placeholder="输入项目编号，例如 GW-JS-2026-0893">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">当前阶段</label>
+                        <select class="form-select" id="orderStatus">
+                            <option value="sales-contract">销售开启合同</option>
+                            <option value="pm-bt09">PM开启BT09</option>
+                            <option value="pa-so-bt09">PA回复SO/BT09</option>
+                            <option value="iprocess">iProcess审批</option>
+                            <option value="book-order">Book订单申请</option>
+                            <option value="factory-bt">工厂BT回复</option>
+                            <option value="factory-oa">工厂反馈OA</option>
+                            <option value="review-required">需要人工审核</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-help" id="archiveMeta" hidden></div>
+                <div class="form-help sync-meta" id="syncMeta" hidden></div>
+                <section class="attachment-panel" id="attachmentPanel" hidden>
+                    <div class="attachment-panel__header">
+                        <div>
+                            <div class="attachment-panel__title">邮件附件</div>
+                            <div class="attachment-panel__subtitle" id="attachmentPanelSubtitle">当前项目关联邮件中的全部附件</div>
+                        </div>
+                    </div>
+                    <div class="attachment-list" id="attachmentList"></div>
+                </section>
+                <div class="form-group">
+                    <label class="form-label">备注</label>
+                    <textarea class="form-textarea" id="orderNotes" placeholder="项目备注信息..." rows="3"></textarea>
+                </div>
+            </div>
+            <div class="modal__footer">
+                <div class="modal__footer-left">
+                    <button class="btn btn--outline" id="btnOpenOriginalEmail" type="button" hidden>查看原始邮件</button>
+                    <button class="btn btn--archive" id="btnArchiveOrder" type="button" hidden>归档项目</button>
+                    <button class="btn btn--danger" id="btnDeleteOrder" type="button" hidden>删除项目</button>
+                </div>
+                <div class="modal__footer-actions">
+                    <button class="btn btn--ghost" id="btnCancelOrder" type="button">取消</button>
+                    <button class="btn btn--primary" id="btnConfirmOrder" type="button">添加</button>
+                </div>
+            </div>
         </div>
     </div>
 
     <div class="modal-overlay sync-modal-overlay" id="syncModalOverlay" aria-hidden="true">
-        <div class="modal sync-modal">
-            <div class="modal__header"><div class="modal__title"><span id="syncModalTitle">同步 Outlook</span></div><button class="modal__close" id="syncModalClose">&times;</button></div>
-            <div class="modal__body">
-                <div class="form-row"><div class="form-group"><label class="form-label">邮箱账号</label><input type="email" class="form-input" id="syncMailbox"></div><div class="form-group"><label class="form-label">文件夹路径</label><input type="text" class="form-input" id="syncFolder" placeholder="Inbox"></div></div>
-                <div class="form-row"><div class="form-group"><label class="form-label">开始日期</label><input type="date" class="form-input" id="syncStartDate"></div><div class="form-group"><label class="form-label">结束日期</label><input type="date" class="form-input" id="syncEndDate"></div></div>
-                <div class="sync-checkbox-group"><label class="sync-checkbox"><input type="checkbox" id="syncIncludeSubfolders" checked>包含子文件夹</label><label class="sync-checkbox"><input type="checkbox" id="syncUseAiReview" checked>使用 AI 复核</label></div>
-                <div class="sync-status" id="syncStatus" hidden><div class="sync-status__header"><span id="syncStatusText">准备同步...</span></div><div class="sync-status__bar"><div class="sync-status__bar-fill" id="syncProgressBar"></div></div><div class="sync-log" id="syncLog"></div></div>
+        <div class="modal sync-modal" role="dialog" aria-modal="true" aria-labelledby="syncModalTitle">
+            <div class="modal__header">
+                <div class="modal__title">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
+                        <path d="M21 12a9 9 0 11-2.64-6.36"/>
+                        <polyline points="21,3 21,9 15,9"/>
+                    </svg>
+                    <span id="syncModalTitle">同步 Outlook</span>
+                </div>
+                <button class="modal__close" id="syncModalClose" aria-label="关闭">&times;</button>
             </div>
-            <div class="modal__footer"><button class="btn btn--ghost" id="btnCancelSync">取消</button><button class="btn btn--primary" id="btnConfirmSync">确认同步</button></div>
+            <div class="modal__body">
+                <div class="sync-modal__notice">
+                    启动页面不会自动运行后端同步。点击确认后才会连接 Windows 传统 Outlook、抓取邮件与附件，并更新项目进展。
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label">邮箱账号 <span class="required">*</span></label>
+                        <input type="email" class="form-input" id="syncMailbox" placeholder="thomas-zhongyan.guo@cn.abb.com">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">文件夹路径 <span class="required">*</span></label>
+                        <input type="text" class="form-input" id="syncFolder" placeholder="Inbox">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label">开始日期</label>
+                        <input type="date" class="form-input" id="syncStartDate">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">结束日期</label>
+                        <input type="date" class="form-input" id="syncEndDate">
+                    </div>
+                </div>
+                <div class="sync-checkbox-group">
+                    <label class="sync-checkbox">
+                        <input type="checkbox" id="syncIncludeSubfolders" checked>
+                        <span>包含子文件夹</span>
+                    </label>
+                    <label class="sync-checkbox">
+                        <input type="checkbox" id="syncUseAiReview" checked>
+                        <span>使用 DeepSeek AI 复核人工审核候选</span>
+                    </label>
+                </div>
+                <div class="sync-modal__notice sync-modal__notice--compact">
+                        当前为完整扫描：每次都会扫描所选日期范围内的全部邮件，不使用增量跳过机制。开启 DeepSeek AI 后，系统仍先用规则自动确认明确邮件；只有规则无法确认、原本需要人工审核的少量候选才会交给 DeepSeek 模型复核。
+                </div>
+                <div class="sync-status" id="syncStatus" hidden>
+                    <div class="sync-status__header">
+                        <span id="syncStatusText">准备同步...</span>
+                        <span id="syncStatusSummary"></span>
+                    </div>
+                    <div class="sync-status__bar"><div class="sync-status__bar-fill" id="syncProgressBar"></div></div>
+                    <div class="sync-log" id="syncLog"></div>
+                </div>
+            </div>
+            <div class="modal__footer">
+                <div class="modal__footer-left">
+                    <span class="sync-modal__hint">默认日期：本机时间往前 7 天。</span>
+                </div>
+                <div class="modal__footer-actions">
+                    <button class="btn btn--ghost" id="btnCancelSync" type="button">取消</button>
+                    <button class="btn btn--primary" id="btnConfirmSync" type="button">确认同步</button>
+                </div>
+            </div>
         </div>
     </div>
 
-    <!-- Confirm Dialog -->
-    <div class="abb-dialog-overlay" id="dialogOverlay" aria-hidden="true">
-        <div class="abb-dialog"><div class="abb-dialog__stripe"></div><div class="abb-dialog__body"><div class="abb-dialog__icon" id="dialogIcon">!</div><div class="abb-dialog__content"><h3 class="abb-dialog__title" id="dialogTitle">确认操作</h3><p class="abb-dialog__message" id="dialogMessage">该操作需要确认。</p></div></div><div class="abb-dialog__footer"><button class="btn btn--ghost" id="dialogCancel">取消</button><button class="btn btn--primary" id="dialogConfirm">确认</button></div></div>
+
+    <div class="modal-overlay bulk-delete-overlay" id="bulkDeleteOverlay" aria-hidden="true">
+        <div class="modal bulk-delete-modal" role="dialog" aria-modal="true" aria-labelledby="bulkDeleteTitle">
+            <div class="modal__header">
+                <div class="modal__title">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
+                        <polyline points="3,6 5,6 21,6"/>
+                        <path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/>
+                        <path d="M10 11v6M14 11v6M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2"/>
+                    </svg>
+                    <span id="bulkDeleteTitle">删除全部</span>
+                </div>
+                <button class="modal__close" id="bulkDeleteClose" aria-label="关闭">&times;</button>
+            </div>
+            <div class="modal__body">
+                <div class="bulk-delete__notice">
+                    请选择要删除的分类。删除范围会受到当前页签、当前搜索关键词、当前可见列影响；确认后会删除所有勾选分类内的事件。
+                </div>
+                <label class="bulk-delete__select-all">
+                    <input type="checkbox" id="bulkDeleteSelectAll">
+                    <span>全选当前可删除事件</span>
+                    <strong id="bulkDeleteTotalCount">0</strong>
+                </label>
+                <div class="bulk-delete__groups" id="bulkDeleteGroups"></div>
+            </div>
+            <div class="modal__footer">
+                <div class="modal__footer-left">
+                    <span class="bulk-delete__summary" id="bulkDeleteSummary">请选择至少一个分类。</span>
+                </div>
+                <div class="modal__footer-actions">
+                    <button class="btn btn--ghost" id="btnCancelBulkDelete" type="button">取消</button>
+                    <button class="btn btn--danger" id="btnConfirmBulkDelete" type="button" disabled>确认删除</button>
+                </div>
+            </div>
+        </div>
     </div>
 
-    <!-- New Case Dialog for Document Check -->
-    <div class="abb-dialog-overlay" id="dcNewCaseDialogOverlay" aria-hidden="true">
-        <div class="abb-dialog">
+    <div class="abb-dialog-overlay" id="dialogOverlay" aria-hidden="true">
+        <div class="abb-dialog" role="dialog" aria-modal="true" aria-labelledby="dialogTitle">
             <div class="abb-dialog__stripe"></div>
             <div class="abb-dialog__body">
-                <div class="abb-dialog__icon" id="dcNewCaseDialogIcon">+</div>
+                <div class="abb-dialog__icon" id="dialogIcon">!</div>
                 <div class="abb-dialog__content">
-                    <h3 class="abb-dialog__title" id="dcNewCaseDialogTitle">新建 Case</h3>
-                    <div style="margin-top:12px;">
-                        <label class="form-label">Case 名称</label>
-                        <input type="text" class="form-input" id="dcNewCaseName" placeholder="输入 Case 名称" value="测试">
-                    </div>
+                    <h3 class="abb-dialog__title" id="dialogTitle">确认操作</h3>
+                    <p class="abb-dialog__message" id="dialogMessage">该操作需要确认。</p>
                 </div>
             </div>
             <div class="abb-dialog__footer">
-                <button class="btn btn--ghost" id="dcNewCaseDialogCancel">取消</button>
-                <button class="btn btn--primary" id="dcNewCaseDialogConfirm">创建</button>
+                <button class="btn btn--ghost" id="dialogCancel" type="button">取消</button>
+                <button class="btn btn--primary" id="dialogConfirm" type="button">确认</button>
             </div>
         </div>
     </div>
-
     <div class="toast-container" id="toastContainer" aria-live="polite"></div>
 
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
     <script src="js/data.js"></script>
     <script src="js/api.js"></script>
     <script src="js/sidebar.js"></script>
-    <script src="js/document-check.js"></script>
     <script src="js/app.js"></script>
 </body>
 </html>
