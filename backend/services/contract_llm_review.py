@@ -34,39 +34,23 @@ def build_contract_review_prompt(
     config_result: Dict[str, Any],
     financial_result: Dict[str, Any],
 ) -> List[Dict[str, str]]:
-    """Build system + user messages for the contract comparison LLM review."""
-
-    # Build a structured payload with all extracted data
+    """Build system + user messages for a narrative review of deterministic checks."""
     payload = {
         "contract": _summarize_contract(contract_data),
         "cqp": _summarize_cqp(cqp_data),
         "ta": _summarize_ta(ta_data),
-        "incoterm": {
-            "conclusion": incoterm_result.get("conclusion", ""),
-            "contract_evidence": incoterm_result.get("contract_evidence", ""),
-            "cqp_evidence": incoterm_result.get("cqp_evidence", ""),
-            "consistent": incoterm_result.get("consistent", True),
-        },
+        "incoterm": dict(incoterm_result),
         "consistency_checks": [
             {
-                "name": c.get("check_name", ""),
-                "status": c.get("status", ""),
-                "detail": c.get("detail", ""),
+                "name": check.get("check_name", ""),
+                "status": check.get("status", ""),
+                "detail": check.get("detail", ""),
+                "is_blocker": bool(check.get("is_blocker")),
             }
-            for c in consistency_results
+            for check in consistency_results
         ],
-        "warranty": {
-            "consistent": warranty_result.get("consistent", True),
-            "detail": warranty_result.get("detail", ""),
-            "contract_warranty": warranty_result.get("contract_warranty", []),
-            "cqp_codes": warranty_result.get("cqp_warranty_codes", []),
-        },
-        "configuration": {
-            "overall_consistent": config_result.get("overall_consistent", True),
-            "cqp_only_codes": _get_config_codes(config_result, "cqp_only_codes"),
-            "ta_only_codes": _get_config_codes(config_result, "ta_only_codes"),
-            "desc_mismatches": _get_config_desc_mismatches(config_result),
-        },
+        "warranty": dict(warranty_result),
+        "configuration": dict(config_result),
         "financial": {
             "vat": financial_result.get("vat_check", {}),
             "untaxed": financial_result.get("untaxed_check", {}),
@@ -75,49 +59,36 @@ def build_contract_review_prompt(
     }
 
     system = (
-        "你是 ABB 中国机器人销售合同审核专家。"
-        "你的职责是对合同（Contract）、报价单（CQP）和技术协议（TA）的对比结果进行综合评审。"
-        "请基于提供的结构化提取数据，给出专业的审核意见。"
-        "你只输出一个 JSON 对象，不输出 Markdown、不输出解释、不输出思考过程。"
+        "你是ABB中国机器人销售合同审核助手。规则引擎已经完成证据提取与BLOCKER分级，"
+        "你只能解释和汇总这些结果，不得推翻规则引擎状态，不得补造文件中不存在的字段。"
+        "审核优先级为：合同作为法律依据；CQP用于商业报价验证；TA用于技术配置闭环。"
+        "只输出一个JSON对象，不输出Markdown、解释或思考过程。"
     )
 
     user = f"""
-请对以下合同对比数据进行综合AI审核：
+请根据以下规则检查结果生成中文审核摘要。
 
-## 审核要求
+必须遵守：
+1. 只要 consistency_checks 中存在 is_blocker=true，overall_assessment 必须为 Blocked。
+2. 没有BLOCKER但存在 WARNING/UNDETERMINED 时，必须为 Pass with notes。
+3. 合同交期与CQP不同通常是非阻塞说明，BT09以合同为准；不得仅因此判Blocked。
+4. 合同与CQP金额差异小于人民币1元属于舍入说明，不得仅因此判Blocked。
+5. TA可以是独立文件，也可以嵌在合同附件中；只有两处都不存在时才判缺失。
+6. Incoterm勾选OCR不清不等于阻塞；若合同交付地点与CQP证据可合理推定，应保留备注。
+7. 付款条件必须引用合同附件二原文，不能简写为比例组合。
+8. 中英文名称或代码/描述能够映射到同一配置时，属于表述差异，不得判技术不一致。
 
-1. **整体评估**：根据所有数据给出 overall_assessment（Pass / Pass with notes / Blocked）
-2. **关键风险**：列出所有需要关注的 blocker 级别问题，每条包含 risk 和 suggestion
-3. **非阻塞问题**：列出所有 non-blocker 级别的问题，每条包含 issue 和 note
-4. **数据完整性**：检查是否存在缺失的关键字段，给出 completeness_notes
-5. **推荐操作**：给出下一步建议的 next_steps（列表）
-6. **审核总结**：用中文写一段 2-4 句话的 summary，概括整体情况
-
-## 判断标准
-
-- Blocked：存在合同号不一致、贸易术语冲突、型号不匹配、数量不一致、质保冲突等严重问题
-- Pass with notes：存在轻微差异（如翻译差异、舍入误差、非关键字段缺失），但核心条款一致
-- Pass：所有关键字段一致，无任何差异
-
-## 提取数据
-
-```json
+提取与检查数据：
 {json.dumps(payload, ensure_ascii=False, indent=2)}
-```
 
-## 返回 JSON 格式（严格遵守）
-
+严格返回：
 {{
   "overall_assessment": "Pass|Pass with notes|Blocked",
-  "key_risks": [
-    {{"risk": "风险描述", "severity": "high|medium|low", "suggestion": "建议措施"}}
-  ],
-  "non_blocker_issues": [
-    {{"issue": "问题描述", "note": "备注说明"}}
-  ],
-  "completeness_notes": "数据完整性评估（中文）",
-  "next_steps": ["建议1", "建议2"],
-  "summary": "综合审核总结（2-4句中文）",
+  "key_risks": [{{"risk": "风险描述", "severity": "high|medium|low", "suggestion": "建议措施"}}],
+  "non_blocker_issues": [{{"issue": "问题描述", "note": "备注说明"}}],
+  "completeness_notes": "数据完整性评估",
+  "next_steps": ["下一步"],
+  "summary": "2-4句中文总结",
   "confidence": 0.0
 }}
 """.strip()
@@ -125,21 +96,22 @@ def build_contract_review_prompt(
 
 
 def _summarize_contract(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Create a clean summary of contract extracted fields."""
     return {
         "contract_number": data.get("contract_number", ""),
+        "cqp_reference": data.get("cqp_reference", ""),
         "seller_name": data.get("seller_name", ""),
         "buyer_name": data.get("buyer_name", ""),
-        "buyer_address": truncate(data.get("buyer_address", ""), 200),
+        "buyer_address": truncate(data.get("buyer_address", ""), 300),
         "end_customer_name": data.get("end_customer_name", ""),
-        "end_customer_address": truncate(data.get("end_customer_address", ""), 200),
-        "robot_models": data.get("robot_models", []),
-        "total_qty": data.get("total_qty", 0),
-        "incoterm_selection": data.get("incoterm_selection", ""),
+        "end_customer_address": truncate(data.get("end_customer_address", ""), 300),
         "delivery_location": data.get("delivery_location", ""),
-        "delivery_time": data.get("delivery_time", []),
-        "payment_terms_annex2": truncate(data.get("payment_terms_annex2", ""), 500),
-        "warranty_clause_5_2": data.get("warranty_clause_5_2", {}),
+        "products": data.get("products", []),
+        "total_qty": data.get("total_qty", 0),
+        "incoterm_detection": data.get("incoterm_detection", {}),
+        "delivery_schedule": data.get("delivery_schedule", []),
+        "delivery_trigger": data.get("delivery_trigger", ""),
+        "payment_terms_annex2": truncate(data.get("payment_terms", {}).get("raw", ""), 1500),
+        "warranty_clause_5_2": data.get("warranty", {}),
         "vat_rate": data.get("vat_rate", 0),
         "untaxed_amount": data.get("untaxed_amount", 0),
         "tax_included_amount": data.get("tax_included_amount", 0),
@@ -149,29 +121,35 @@ def _summarize_contract(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _summarize_cqp(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Create a clean summary of CQP extracted fields."""
     return {
         "cqp_number": data.get("cqp_number", ""),
+        "version": data.get("version", ""),
         "customer_name": data.get("customer_name", ""),
-        "customer_address": truncate(data.get("customer_address", ""), 200),
+        "customer_address": truncate(data.get("customer_address", ""), 300),
         "end_user": data.get("end_user", ""),
         "delivery_term": data.get("delivery_term", ""),
         "delivery_time": data.get("delivery_time", ""),
-        "payment_terms": truncate(data.get("payment_terms", ""), 300),
+        "payment_terms": truncate(data.get("payment_terms", {}).get("raw", ""), 1000),
         "warranty_terms": data.get("warranty_terms", ""),
-        "robot_models": data.get("robot_models", []),
+        "products": data.get("products", []),
+        "total_qty": data.get("total_qty", 0),
         "untaxed_total": data.get("untaxed_total", 0),
         "vat_rate": data.get("vat_rate", 0),
         "tax_included_total": data.get("tax_included_total", 0),
-        "warranty_codes": data.get("warranty_codes", []),
+        "warranty_codes_by_model": data.get("warranty_codes_by_model", {}),
+        "configurations": data.get("configurations", []),
     }
 
 
 def _summarize_ta(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Create a clean summary of TA extracted fields."""
     return {
-        "robot_models": data.get("robot_models", []),
-        "warranty_codes": data.get("warranty_codes", []),
+        "contract_number": data.get("contract_number", ""),
+        "buyer_name": data.get("buyer_name", ""),
+        "seller_name": data.get("seller_name", ""),
+        "products": data.get("products", []),
+        "total_qty": data.get("total_qty", 0),
+        "warranty_codes_by_model": data.get("warranty_codes_by_model", {}),
+        "configurations": data.get("configurations", []),
     }
 
 
@@ -282,7 +260,19 @@ def run_llm_contract_review(
         )
         content = call_llm_chat(cfg, messages)
         parsed = extract_json_object(content)
-        return normalize_contract_llm_response(parsed)
+        normalized = normalize_contract_llm_response(parsed)
+
+        # The LLM is narrative-only. Enforce the deterministic rule-engine
+        # conclusion in code rather than trusting prompt compliance.
+        has_blocker = any(bool(check.get("is_blocker")) for check in consistency_results)
+        has_notes = any(
+            str(check.get("status", "")).upper() in {"WARNING", "UNDETERMINED", "MISMATCH"}
+            for check in consistency_results
+        )
+        normalized["overall_assessment"] = (
+            "Blocked" if has_blocker else ("Pass with notes" if has_notes else "Pass")
+        )
+        return normalized
     except Exception as exc:
         return {
             "error": str(exc),
