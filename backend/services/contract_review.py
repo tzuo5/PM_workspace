@@ -17,7 +17,13 @@ from services.contract_review_engine import *  # noqa: F401,F403
 from services.contract_review_engine import __all__ as _ENGINE_ALL
 from services.contract_review_engine import run_review as _engine_run_review
 from services.contract_review_knowledge import get_contract_review_knowledge
+from services.llm_console import install_contract_review_console
 
+
+# Install after the engine import so the already-imported contract LLM module is
+# wrapped regardless of whether the backend is started through server.py or the
+# convenience launcher.
+install_contract_review_console()
 
 _BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _ROOT_DIR = os.path.dirname(_BACKEND_DIR)
