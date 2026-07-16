@@ -84,3 +84,11 @@ var emptyStateMessages = {
     "factory-oa": { icon: "📦", title: "暂无工厂反馈OA", desc: "工厂反馈OA后，项目可进入最终确认或归档" },
     "review-required": { icon: "?", title: "暂无待审核", desc: "低置信度邮件会集中到这里，确认后可拖到正确阶段" }
 };
+
+// Load the contract debug exporter without coupling it to the review controller.
+(function loadContractDebugExporter() {
+    var script = document.createElement("script");
+    script.src = "js/contract-debug-export.js";
+    script.async = false;
+    document.head.appendChild(script);
+})();
