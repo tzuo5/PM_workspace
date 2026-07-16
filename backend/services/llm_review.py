@@ -9,6 +9,8 @@ DeepSeek API: https://api.deepseek.com/v1/chat/completions
 
 from __future__ import annotations
 
+# CONTRACT_REVIEW_M4367_PATCH_V3: llm-metadata
+
 import json
 import os
 import re
@@ -268,8 +270,13 @@ def _build_request(url: str, data_bytes: bytes, headers: Dict[str, str], timeout
     return req
 
 
-def call_llm_chat(config: Dict[str, Any], messages: List[Dict[str, str]]) -> str:
-    """Send a chat completion request with retry + rate-limit handling."""
+def call_llm_chat(
+    config: Dict[str, Any],
+    messages: List[Dict[str, str]],
+    *,
+    return_metadata: bool = False,
+) -> Any:
+    """Send a chat-completion request and optionally retain finish diagnostics."""
     base_url = to_str(config.get("base_url") or "https://api.deepseek.com/v1").rstrip("/")
     url = base_url + "/chat/completions"
     max_retries = int(config.get("max_retries", 3))
@@ -285,42 +292,43 @@ def call_llm_chat(config: Dict[str, Any], messages: List[Dict[str, str]]) -> str
         "stream": False,
     }
     raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
-
     last_error: Optional[Exception] = None
 
     for attempt in range(max_retries + 1):
         try:
-            headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            }
+            headers = {"Content-Type": "application/json", "Accept": "application/json"}
             if api_key:
                 headers["Authorization"] = f"Bearer {api_key}"
-
             req = urllib.request.Request(url, data=raw, headers=headers, method="POST")
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
-                return payload["choices"][0]["message"]["content"]
+            choices = payload.get("choices") or []
+            if not choices:
+                raise RuntimeError("LLM响应缺少choices字段。")
+            choice = choices[0] or {}
+            content = to_str((choice.get("message") or {}).get("content", ""))
+            result = {
+                "content": content,
+                "finish_reason": to_str(choice.get("finish_reason", "")),
+                "usage": payload.get("usage") if isinstance(payload.get("usage"), dict) else {},
+                "model": to_str(payload.get("model") or data["model"]),
+            }
+            return result if return_metadata else content
 
         except urllib.error.HTTPError as exc:
             status = exc.code
             last_error = exc
             if status == 401:
                 raise RuntimeError(
-                    f"DeepSeek API 认证失败（401）。请检查 API Key 是否正确。"
-                    f"当前 Key: {redact_key(api_key)}"
+                    f"DeepSeek API 认证失败（401）。请检查 API Key 是否正确。当前 Key: {redact_key(api_key)}"
                 ) from exc
             if status == 402:
-                raise RuntimeError(
-                    "DeepSeek 账户余额不足（402）。请充值后重试。"
-                ) from exc
+                raise RuntimeError("DeepSeek 账户余额不足（402）。请充值后重试。") from exc
             if status == 429 and attempt < max_retries:
-                wait = retry_delay * (2 ** attempt)
-                time.sleep(wait)
+                time.sleep(retry_delay * (2 ** attempt))
                 continue
             if _is_retryable_http_error(status) and attempt < max_retries:
-                wait = retry_delay * (2 ** attempt)
-                time.sleep(wait)
+                time.sleep(retry_delay * (2 ** attempt))
                 continue
             raise RuntimeError(
                 f"DeepSeek API 返回 HTTP {status}（attempt {attempt + 1}/{max_retries + 1}）"
@@ -329,18 +337,14 @@ def call_llm_chat(config: Dict[str, Any], messages: List[Dict[str, str]]) -> str
         except (urllib.error.URLError, OSError) as exc:
             last_error = exc
             if attempt < max_retries:
-                wait = retry_delay * (2 ** attempt)
-                time.sleep(wait)
+                time.sleep(retry_delay * (2 ** attempt))
                 continue
-            raise RuntimeError(
-                f"无法连接 DeepSeek API（{base_url}）：{exc}"
-            ) from exc
+            raise RuntimeError(f"无法连接 DeepSeek API（{base_url}）：{exc}") from exc
 
         except Exception as exc:
             last_error = exc
             if attempt < max_retries:
-                wait = retry_delay * (2 ** attempt)
-                time.sleep(wait)
+                time.sleep(retry_delay * (2 ** attempt))
                 continue
             raise RuntimeError(f"DeepSeek API 调用失败：{exc}") from exc
 

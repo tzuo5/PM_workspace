@@ -9,6 +9,8 @@ states are decided here from extracted evidence.
 
 from __future__ import annotations
 
+# CONTRACT_REVIEW_M4367_PATCH_V3: engine
+
 import csv
 import os
 import re
@@ -33,6 +35,7 @@ from services.pdf_evidence import (
     locate_evidence,
     match_key,
     normalize_for_match,
+    ocr_pdf_pages,
     parse_pdf_with_evidence,
 )
 
@@ -175,28 +178,125 @@ def _normalize_extraction_text(value: str) -> str:
 
 
 def _extract_payment_source(text: str) -> str:
-    """Prefer the real Annex 2 payment section over TOC/earlier mentions."""
-    source = _normalize_extraction_text(text).replace("\r\n", "\n").replace("\r", "\n")
-    annexes = list(re.finditer(r"附件\s*二[^\n]{0,120}(?:付款方式|付款条件)", source, re.I))
-    if annexes:
-        start = annexes[-1].start()
-    else:
-        headings = list(re.finditer(r"(?m)^\s*(?:付款条件|付款方式)\s*[:：]?", source, re.I))
-        if headings:
-            start = headings[-1].start()
-        else:
-            inline = list(re.finditer(r"(?:付款条件|付款方式)\s*[:：]?", source, re.I))
-            start = inline[-1].start() if inline else 0
-    section = source[start:]
-    end = re.search(
-        r"(?m)^\s*(?:附件\s*[三四五六]|诚信条款|违约责任|合同解除|解除合同|取消条款|"
-        r"质量保证|质保条款|保修条款|交货条款|贸易术语|签字盖章)\b",
-        section[1:],
-        re.I,
+    """Select the real Annex 2 body while preserving its original punctuation."""
+    source = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    stop_pattern = (
+        r"(?m)^\s*(?:附件\s*[三四五六](?:\s*[^\n]*)?|诚信条款|违约责任|合同解除|解除合同|取消条款|"
+        r"质量保证|质保条款|保修条款|交货条款|贸易术语|签字盖章)\s*[:：]?"
     )
+    candidates: List[Tuple[int, int, str]] = []
+    for match in re.finditer(r"(?m)^\s*附件\s*二(?:\s*[^\n]*)?$", source, re.I):
+        section = source[match.start(): match.start() + 10000]
+        end = re.search(stop_pattern, section[1:], re.I)
+        if end:
+            section = section[: end.start() + 1]
+        normalized_section = _normalize_extraction_text(section)
+        compact_section = match_key(normalized_section)
+        score = 0
+        score += 8 if "付款条件" in normalized_section else 0
+        score += 4 if "付款方式" in normalized_section else 0
+        score += 5 if "合同总价" in normalized_section else 0
+        score += min(12, 3 * len(re.findall(r"百分之|\d+(?:[.]\d+)?\s*%", normalized_section)))
+        score += 3 if "电汇" in normalized_section else 0
+        score += 3 if "承兑" in normalized_section else 0
+        score += 3 if "发票" in normalized_section else 0
+        score += 2 if any(term in compact_section for term in ("用户银行", "账户号码", "账号")) else 0
+        candidates.append((score, match.start(), section.strip()))
+
+    if candidates:
+        score, _, section = max(candidates, key=lambda item: (item[0], item[1]))
+        if score >= 8:
+            return section[:8000]
+
+    headings = list(re.finditer(r"(?m)^\s*(?:付款条件|付款方式)\s*(?:[（(][^\n）)]*[）)])?\s*[:：]?", source, re.I))
+    if headings:
+        start = headings[-1].start()
+    else:
+        inline = list(re.finditer(r"(?:付款条件|付款方式)\s*[:：]?", source, re.I))
+        start = inline[-1].start() if inline else 0
+    section = source[start:]
+    end = re.search(stop_pattern, section[1:], re.I)
     if end:
         section = section[: end.start() + 1]
     return section[:8000].strip()
+
+
+def _extract_labeled_money(text: str, labels: Sequence[str], *, not_preceded_by: str = "") -> float:
+    """Extract one monetary value after an explicit label.
+
+    This is intentionally independent from the broader `_match_first` helper so
+    template underscores and optional currency tokens cannot shift capture groups.
+    """
+    normalized = _normalize_extraction_text(text)
+    label_pattern = "|".join(re.escape(label) for label in labels if label)
+    if not label_pattern:
+        return 0.0
+    prefix_guard = rf"(?<!{re.escape(not_preceded_by)})" if not_preceded_by else ""
+    match = re.search(
+        rf"{prefix_guard}(?:{label_pattern})(?:为)?\s*[:：]?\s*(?:CNY|RMB|人民币)?\s*[:：]?\s*([\d,]+(?:[.]\d{{1,2}})?)",
+        normalized,
+        re.I,
+    )
+    return _parse_money(match.group(1)) if match else 0.0
+
+
+def _payment_terms_score(terms: Dict[str, Any]) -> Tuple[int, int, int]:
+    state_rank = {"MISSING": 0, "EXTRACTION_FAILED": 1, "INCOMPLETE": 2, "EXTRACTED": 3}
+    return (
+        state_rank.get(str(terms.get("extraction_state", "")), 0),
+        len(terms.get("percentages", []) or []),
+        len(str(terms.get("raw", "") or "")),
+    )
+
+
+def _payment_ocr_candidate_pages(parsed: Optional[ParsedPDF], max_pages: int = 6) -> List[int]:
+    if parsed is None:
+        return []
+    keyword_pages: List[int] = []
+    low_text_pages: List[int] = []
+    for page in parsed.pages:
+        text = _normalize_extraction_text(page.text)
+        if re.search(r"附件\s*二|付款方式|付款条件", text, re.I):
+            keyword_pages.append(page.page_num)
+        if page.page_num > 1 and len(match_key(text)) < 80:
+            low_text_pages.append(page.page_num)
+    ordered = keyword_pages + list(reversed(low_text_pages))
+    result: List[int] = []
+    for page_num in ordered:
+        if page_num not in result:
+            result.append(page_num)
+        if len(result) >= max_pages:
+            break
+    return sorted(result)
+
+
+def _extract_contract_delivery(parsed: Optional[ParsedPDF]) -> Dict[str, Any]:
+    if parsed is None:
+        return {"weeks": 0, "trigger": "", "raw": "", "page": 0}
+    trigger_phrases = (
+        "合同生效且收到预付款后",
+        "合同生效并收到预付款后",
+        "合同生效且预付款到账后",
+        "自合同生效且收到预付款之日起",
+        "自合同生效之日起",
+        "合同生效",
+        "预付款到账后",
+    )
+    for page in parsed.pages:
+        text = _normalize_extraction_text(page.text)
+        for anchor in re.finditer(r"(?:发运时间|发货时间|交货时间|交付周期|交期)\s*[:：]?", text, re.I):
+            window = text[anchor.start(): anchor.start() + 520]
+            weeks_match = re.search(r"(?<!\d)(\d{1,3})\s*周", window, re.I)
+            if not weeks_match:
+                continue
+            trigger = next((phrase for phrase in trigger_phrases if phrase in window[: weeks_match.end() + 80]), "")
+            return {
+                "weeks": int(weeks_match.group(1)),
+                "trigger": trigger,
+                "raw": _clean_inline(window[: weeks_match.end()]),
+                "page": page.page_num,
+            }
+    return {"weeks": 0, "trigger": "", "raw": "", "page": 0}
 
 
 def _looks_like_configuration_code(code: str, line: str, description: str) -> bool:
@@ -1018,7 +1118,8 @@ def _config_match(
 def extract_contract(parsed: Optional[ParsedPDF]) -> Dict[str, Any]:
     if parsed is None:
         return {}
-    text = _normalize_extraction_text(parsed.full_text)
+    source_text = parsed.full_text or "\n".join(page.text for page in parsed.pages)
+    text = _normalize_extraction_text(source_text)
     first_pages = "\n".join(_normalize_extraction_text(page.text) for page in parsed.pages[:3])
     transport_text = "\n".join(_normalize_extraction_text(page.text) for page in parsed.pages[:5])
     signature_text = "\n".join(_normalize_extraction_text(page.text) for page in parsed.pages[-3:])
@@ -1031,27 +1132,44 @@ def extract_contract(parsed: Optional[ParsedPDF]) -> Dict[str, Any]:
     seller_address = _match_first(first_pages, [r"卖方[:：].*?地址[:：]\s*(.*?)(?:目录|合同编号|$)", r"卖方地址[:：]\s*([^\n]+)"], re.S)
     quantities = _extract_model_quantities(parsed)
     delivery_schedule = _extract_delivery_schedule(parsed)
+    contract_delivery = _extract_contract_delivery(parsed)
 
-    money = r"([\d,]+(?:[.]\d{1,2})?)"
-    untaxed_text = _match_first(text, [
-        rf"不含增值税(?:总额|金额)?(?:为)?\s*[:：]?\s*(?:CNY|RMB|人民币)?\s*[:：]?\s*{money}",
-        rf"(?:未税金额|未税总额)\s*[:：]?\s*(?:CNY|RMB|人民币)?\s*[:：]?\s*{money}",
-    ])
-    gross_text = _match_first(text, [
-        rf"(?<!不)含增值税(?:总额|金额)?(?:为)?\s*[:：]?\s*(?:CNY|RMB|人民币)?\s*[:：]?\s*{money}",
-        rf"合同价格的含增值税总额为\s*[:：]?.*?{money}",
-    ])
+    untaxed_amount = _extract_labeled_money(
+        text,
+        ("不含增值税总额", "不含增值税金额", "未税金额", "未税总额"),
+    )
+    tax_included_amount = _extract_labeled_money(
+        text,
+        ("合同价格的含增值税总额", "含增值税总额", "含增值税金额", "含税总额", "含税金额"),
+        not_preceded_by="不",
+    )
     vat_text = _match_first(text, [r"(?:增值税(?:税率)?|税率)\s*[:：]?\s*(\d{1,2}(?:[.]\d+)?)\s*%"])
 
-    delivery_trigger = ""
-    for phrase in ("合同生效且收到预付款后", "合同生效并收到预付款后", "合同生效且预付款到账后", "预付款到账后"):
-        if phrase in text:
-            delivery_trigger = phrase
-            break
+    delivery_trigger = str(contract_delivery.get("trigger", ""))
+    if not delivery_trigger:
+        for phrase in ("合同生效且收到预付款后", "合同生效并收到预付款后", "合同生效且预付款到账后", "预付款到账后"):
+            if phrase in text:
+                delivery_trigger = phrase
+                break
 
     placeholder_text = re.sub(r"\s+", "", signature_text + "\n" + text)
     known_placeholders = {"@@@Chop_ABB", "@@@Chop_Customer", "@@@Sign_ABBPerson", "@@@Sign_CustomerPerson"}
+
     payment_terms = _extract_payment_terms(text)
+    payment_terms.setdefault("ocr_used", False)
+    payment_terms.setdefault("ocr_pages", [])
+    if payment_terms.get("extraction_state") != "EXTRACTED":
+        candidate_pages = _payment_ocr_candidate_pages(parsed)
+        ocr_by_page = ocr_pdf_pages(parsed.filepath, candidate_pages)
+        if ocr_by_page:
+            ocr_text = "\n".join(f"[OCR PAGE {page}]\n{ocr_by_page[page]}" for page in sorted(ocr_by_page))
+            ocr_terms = _extract_payment_terms(text + "\n" + ocr_text)
+            if _payment_terms_score(ocr_terms) > _payment_terms_score(payment_terms):
+                payment_terms = ocr_terms
+                payment_terms["ocr_used"] = True
+                payment_terms["ocr_pages"] = sorted(ocr_by_page)
+
+    delivery_weeks = int(contract_delivery.get("weeks", 0) or 0)
     return {
         "contract_number": contract_number,
         "cqp_reference": _match_first(text, [r"(?:单价信息|报价单|CQP)[:：]?\s*(CQ\d{7})", r"\b(CQ\d{7})\b"]),
@@ -1072,28 +1190,32 @@ def extract_contract(parsed: Optional[ParsedPDF]) -> Dict[str, Any]:
         "products": [{"model": model, "qty": qty} for model, qty in quantities.items()],
         "total_qty": sum(quantities.values()),
         "delivery_schedule": delivery_schedule,
+        "delivery_weeks": delivery_weeks,
+        "delivery_raw": contract_delivery.get("raw", ""),
+        "delivery_page": int(contract_delivery.get("page", 0) or 0),
         "delivery_trigger": delivery_trigger,
         "split_delivery": bool(re.search(r"允许分批(?:装运|发货)", text)),
         "incoterm_detection": _detect_contract_incoterm(transport_text),
-        "untaxed_amount": _parse_money(untaxed_text),
+        "untaxed_amount": untaxed_amount,
         "vat_rate": float(vat_text) / 100 if vat_text else 0.0,
-        "tax_included_amount": _parse_money(gross_text),
+        "tax_included_amount": tax_included_amount,
         "payment_terms": payment_terms,
         "warranty": _extract_warranty_clause(text),
         "signature_placeholders": sorted(token for token in known_placeholders if token in placeholder_text),
         "blank_signature_dates": bool(re.search(r"日期[:：]\s+日期[:：]", signature_text) or re.search(r"日期[:：]\s*(?:\n|$)", signature_text)),
         "attachments": {
             "ta": bool(re.search(r"附件一[^\n]{0,80}技术协议", text)),
-            "payment": bool(re.search(r"附件二[^\n]{0,80}(?:付款方式|付款条件)", text)),
+            "payment": bool(re.search(r"附件二(?:[^\n]{0,80}|\s{0,20})(?:付款方式|付款条件)", text, re.S)),
             "integrity": bool(re.search(r"附件三[^\n]{0,80}诚信条款", text)),
         },
         "file_priority": "本合同优先于附件" if re.search(r"本合同.*?优先于.*?附件|文件优先性", text, re.S) else "",
         "extraction_state": {
             "products": "EXTRACTED" if quantities else "EXTRACTION_FAILED",
-            "delivery_schedule": "EXTRACTED" if delivery_schedule else "EXTRACTION_FAILED",
-            "untaxed_amount": "EXTRACTED" if untaxed_text else "EXTRACTION_FAILED",
+            "delivery_schedule": "EXTRACTED" if (delivery_weeks or delivery_schedule) else "EXTRACTION_FAILED",
+            "delivery_period": "EXTRACTED" if delivery_weeks else "EXTRACTION_FAILED",
+            "untaxed_amount": "EXTRACTED" if untaxed_amount else "EXTRACTION_FAILED",
             "vat_rate": "EXTRACTED" if vat_text else "EXTRACTION_FAILED",
-            "tax_included_amount": "EXTRACTED" if gross_text else "EXTRACTION_FAILED",
+            "tax_included_amount": "EXTRACTED" if tax_included_amount else "EXTRACTION_FAILED",
             "payment_terms": payment_terms.get("extraction_state", "EXTRACTION_FAILED"),
         },
     }
@@ -1291,15 +1413,29 @@ def build_review_items(
 
     contract_no = contract.get("contract_number", "")
     cqp_ref, cqp_no, ta_no = contract.get("cqp_reference", ""), cqp.get("cqp_number", ""), ta.get("contract_number", "")
-    explicit_link_mismatch = bool((cqp_ref and cqp_no and cqp_ref != cqp_no) or (ta_no and contract_no and ta_no != contract_no))
-    link_missing = not contract_no or not cqp_no or not cqp_ref or (ta_has_content and not ta_no)
-    link_status = "MISMATCH" if explicit_link_mismatch else ("WARNING" if link_missing else "PASS")
+    explicit_link_mismatch = bool(contract_no and ta_no and contract_no != ta_no)
+    link_missing = not contract_no or (ta_has_content and not ta_no)
+    link_status = "MISMATCH" if explicit_link_mismatch else ("UNDETERMINED" if link_missing else "PASS")
     items.append(_item(
-        "document_linkage", CATEGORY_CUSTOMER, "文件编号与版本关联", link_status,
+        "document_linkage", CATEGORY_CUSTOMER, "合同编号关联", link_status,
         "blocker" if explicit_link_mismatch else ("warning" if link_missing else "info"),
-        "文件编号存在明确冲突。" if explicit_link_mismatch else ("部分编号或版本未提取，需人工关联。" if link_missing else "合同、CQP和TA编号关联一致。"),
-        {"合同编号": contract_no or "未提取", "合同内CQP引用": cqp_ref or "未提取", "CQP编号": cqp_no or "未提取", "TA合同编号": ta_no or "未提取", "CQP版本": cqp.get("version") or "未提取"},
-        [_evidence(contract_pdf, "contract", "合同编号", [contract_no]), _evidence(contract_pdf, "contract", "CQP引用", [cqp_ref]), _evidence(cqp_pdf, "cqp", "CQP编号", [cqp_no]), _evidence(ta_pdf, "ta", "TA合同编号", [ta_no])],
+        "合同与TA合同编号明确冲突。" if explicit_link_mismatch else (
+            "合同或TA合同编号未提取，需人工确认。" if link_missing else
+            "合同与TA合同编号一致；CQP编号和版本仅展示，不参与合同编号判定。"
+        ),
+        {
+            "合同编号": contract_no or "未提取",
+            "TA合同编号": ta_no or "未提取",
+            "CQP编号（仅展示）": cqp_no or "未提取",
+            "CQP版本（仅展示）": cqp.get("version") or "未提取",
+            "合同内CQP引用（仅展示）": cqp_ref or "未提取",
+        },
+        [
+            _evidence(contract_pdf, "contract", "合同编号", [contract_no]),
+            _evidence(ta_pdf, "ta", "TA合同编号", [ta_no]),
+            _evidence(cqp_pdf, "cqp", "CQP编号（仅展示）", [cqp_no]),
+        ],
+        decision_state="MATCH" if link_status == "PASS" else ("MISMATCH" if link_status == "MISMATCH" else "EXTRACTION_FAILED"),
     ))
 
     seller = contract.get("seller_name", "")
@@ -1359,48 +1495,68 @@ def build_review_items(
     c_products = _product_map(contract.get("products", []))
     q_products = _product_map(cqp.get("products", []))
     t_products = _product_map(ta.get("products", []))
-    expected_models = set(q_products) if q_products else (set(c_products) | set(t_products))
-    missing_model_sources = [name for name, values in (("合同", c_products), ("CQP", q_products), ("TA", t_products if ta_has_content else {})) if not values]
-    if not expected_models:
+    contract_package_models = set(c_products) | set(t_products)
+    expected_models = set(q_products) if q_products else set(contract_package_models)
+    contract_internal_model_conflict = bool(c_products and t_products and set(c_products) != set(t_products))
+
+    if not expected_models and not contract_package_models:
         model_status, model_severity = "UNDETERMINED", "blocker" if source_ok else "warning"
-        model_summary = "未提取到可信机器人型号，无法开展下游型号核对。"
-    elif missing_model_sources:
-        model_status, model_severity = "UNDETERMINED", "blocker" if source_ok else "warning"
-        model_summary = "以下来源未提取到型号：" + "、".join(missing_model_sources) + "。这是抽取失败，不是型号冲突。"
-    elif set(c_products) != set(q_products) or set(t_products) != set(q_products):
+        model_summary = "CQP和合同包均未提取到可信机器人型号。"
+    elif contract_internal_model_conflict:
         model_status, model_severity = "MISMATCH", "blocker"
-        model_summary = "三份文件均已提取型号，但型号集合明确不一致。"
+        model_summary = "合同正文与TA中的机器人型号明确不一致。"
+    elif not q_products:
+        model_status, model_severity = "UNDETERMINED", "blocker" if source_ok else "warning"
+        model_summary = "CQP未提取到机器人型号，无法与合同包比较。"
+    elif not contract_package_models:
+        model_status, model_severity = "UNDETERMINED", "blocker" if source_ok else "warning"
+        model_summary = "合同正文和TA均未提取到机器人型号。"
+    elif set(q_products) != contract_package_models:
+        model_status, model_severity = "MISMATCH", "blocker"
+        model_summary = "CQP与合同包（合同正文+TA）的机器人型号明确不一致。"
     else:
         model_status, model_severity = "PASS", "info"
-        model_summary = "合同、CQP和TA中的机器人型号一致。"
+        model_summary = "CQP与合同包（合同正文+TA）的机器人型号一致。"
     items.append(_item(
         "product_models", CATEGORY_PRODUCT, "机器人型号", model_status, model_severity, model_summary,
-        {"合同": "、".join(c_products) or "未提取", "CQP": "、".join(q_products) or "未提取", "TA": "、".join(t_products) or "未提取"},
-        _evidence_many(contract_pdf, "contract", "合同型号", list(c_products)) + _evidence_many(cqp_pdf, "cqp", "CQP型号", list(q_products)) + _evidence_many(ta_pdf, "ta", "TA型号", list(t_products)),
+        {
+            "合同正文": "、".join(c_products) or "未提取",
+            "TA": "、".join(t_products) or "未提取",
+            "合同包": "、".join(sorted(contract_package_models)) or "未提取",
+            "CQP": "、".join(q_products) or "未提取",
+        },
+        _evidence_many(contract_pdf, "contract", "合同正文型号", list(c_products))
+        + _evidence_many(ta_pdf, "ta", "TA型号", list(t_products))
+        + _evidence_many(cqp_pdf, "cqp", "CQP型号", list(q_products)),
         decision_state="MATCH" if model_status == "PASS" else ("MISMATCH" if model_status == "MISMATCH" else "EXTRACTION_FAILED"),
     ))
 
     quantity_subitems: List[Dict[str, Any]] = []
     quantity_evidence: List[Dict[str, Any]] = []
     quantity_states: List[str] = []
-    for model in sorted(expected_models):
-        cq = int(c_products.get(model, {}).get("qty", 0))
-        qq = int(q_products.get(model, {}).get("qty", 0))
-        tq = int(t_products.get(model, {}).get("qty", 0)) if ta_has_content else 0
-        if not (cq and qq and tq):
-            sub_status, sub_state = "UNDETERMINED", "EXTRACTION_FAILED"
-            sub_summary = f"Contract {cq or '未提取'} / CQP {qq or '未提取'} / TA {tq or '未提取'}；证据不完整。"
-        elif len({cq, qq, tq}) != 1:
+    for model in sorted(expected_models | contract_package_models):
+        contract_qty = int(c_products.get(model, {}).get("qty", 0))
+        ta_qty = int(t_products.get(model, {}).get("qty", 0)) if ta_has_content else 0
+        cqp_qty = int(q_products.get(model, {}).get("qty", 0))
+        package_qty = ta_qty or contract_qty
+        internal_conflict = bool(contract_qty and ta_qty and contract_qty != ta_qty)
+        if internal_conflict:
             sub_status, sub_state = "MISMATCH", "MISMATCH"
-            sub_summary = f"Contract {cq} / CQP {qq} / TA {tq}；数量明确不一致。"
+            sub_summary = f"合同正文 {contract_qty} / TA {ta_qty}；合同包内部数量冲突。"
+        elif not package_qty or not cqp_qty:
+            sub_status, sub_state = "UNDETERMINED", "EXTRACTION_FAILED"
+            sub_summary = f"合同包 {package_qty or '未提取'} / CQP {cqp_qty or '未提取'}；证据不完整。"
+        elif package_qty != cqp_qty:
+            sub_status, sub_state = "MISMATCH", "MISMATCH"
+            sub_summary = f"合同包 {package_qty} / CQP {cqp_qty}；数量明确不一致。"
         else:
             sub_status, sub_state = "PASS", "MATCH"
-            sub_summary = f"Contract / CQP / TA 均为 {cq}。"
+            sub_summary = f"合同包与CQP均为 {package_qty}。"
         quantity_states.append(sub_status)
         evidence = _valid_evidence(
-            _evidence_many(contract_pdf, "contract", model + "数量", [model, str(cq)])
-            + _evidence_many(cqp_pdf, "cqp", model + "数量", [model, str(qq)])
-            + _evidence_many(ta_pdf, "ta", model + "数量", [model, str(tq)])
+            _evidence_many(contract_pdf, "contract", model + "合同正文数量", [model, str(contract_qty)])
+            + _evidence_many(ta_pdf, "ta", model + "TA数量", [model, str(ta_qty)])
+            + _evidence_many(cqp_pdf, "cqp", model + "CQP数量", [model, str(cqp_qty)])
         )
         quantity_subitems.append({
             "id": "quantity_" + re.sub(r"[^a-z0-9]+", "_", model.lower()).strip("_"),
@@ -1408,41 +1564,51 @@ def build_review_items(
             "status": sub_status,
             "decision_state": sub_state,
             "summary": sub_summary,
-            "values": {"Contract": cq or "未提取", "CQP": qq or "未提取", "TA": tq or "未提取"},
+            "values": {
+                "合同正文": contract_qty or "未提取",
+                "TA": ta_qty or "未提取",
+                "合同包": package_qty or "未提取",
+                "CQP": cqp_qty or "未提取",
+            },
             "evidence": evidence,
         })
         quantity_evidence.extend(evidence)
     if "MISMATCH" in quantity_states:
-        quantity_status, quantity_severity, quantity_summary = "MISMATCH", "blocker", "至少一个型号在三份文件中均有数量证据，且数量明确不一致。"
+        quantity_status, quantity_severity, quantity_summary = "MISMATCH", "blocker", "至少一个型号在合同包与CQP之间存在明确数量冲突。"
     elif not quantity_states or "UNDETERMINED" in quantity_states:
         quantity_status = "UNDETERMINED"
         quantity_severity = "warning" if model_status != "PASS" else "blocker"
-        quantity_summary = "数量证据不完整；若型号抽取已失败，本项不再重复生成独立阻塞。"
+        quantity_summary = "合同包或CQP的型号数量证据不完整。"
     else:
-        quantity_status, quantity_severity, quantity_summary = "PASS", "info", "各型号数量一致。"
+        quantity_status, quantity_severity, quantity_summary = "PASS", "info", "合同包与CQP的各型号数量一致。"
+
+    contract_total = int(contract.get("total_qty", 0) or 0)
+    ta_total = int(ta.get("total_qty", 0) or 0)
+    cqp_total = int(cqp.get("total_qty", 0) or 0)
+    package_total = ta_total or contract_total
     items.append(_item(
         "product_quantities", CATEGORY_PRODUCT, "各型号数量", quantity_status, quantity_severity, quantity_summary,
-        {"合同总数": contract.get("total_qty") or "未提取", "CQP总数": cqp.get("total_qty") or "未提取", "TA总数": ta.get("total_qty") or "未提取"},
+        {"合同正文总数": contract_total or "未提取", "TA总数": ta_total or "未提取", "合同包总数": package_total or "未提取", "CQP总数": cqp_total or "未提取"},
         quantity_evidence, quantity_subitems,
         decision_state="MATCH" if quantity_status == "PASS" else ("MISMATCH" if quantity_status == "MISMATCH" else "EXTRACTION_FAILED"),
     ))
 
-    totals = (int(contract.get("total_qty", 0)), int(cqp.get("total_qty", 0)), int(ta.get("total_qty", 0)))
     if quantity_status != "PASS":
         total_status, total_severity = "UNDETERMINED", "warning"
-        total_summary = "总数量依赖各型号数量；上游数量证据未通过，本项不重复生成阻塞。"
-    elif not all(totals):
+        total_summary = "总数量依赖各型号数量；上游证据未通过，本项不重复生成阻塞。"
+    elif not package_total or not cqp_total:
         total_status, total_severity = "UNDETERMINED", "blocker"
-        total_summary = "各型号数量已通过，但至少一个总数量未生成，需检查汇总逻辑。"
-    elif len(set(totals)) != 1:
+        total_summary = "各型号数量已通过，但合同包或CQP总数量未生成。"
+    elif package_total != cqp_total:
         total_status, total_severity = "MISMATCH", "blocker"
-        total_summary = "各型号数量已可比，但三份文件总数量明确不一致。"
+        total_summary = "合同包与CQP的机器人总数量明确不一致。"
     else:
         total_status, total_severity = "PASS", "info"
-        total_summary = f"三份文件的机器人总数量均为{totals[0]}。"
+        total_summary = f"合同包与CQP的机器人总数量均为{package_total}。"
     items.append(_item(
         "total_quantity", CATEGORY_PRODUCT, "机器人总数量", total_status, total_severity, total_summary,
-        {"合同": totals[0] or "未提取", "CQP": totals[1] or "未提取", "TA": totals[2] or "未提取"}, quantity_evidence,
+        {"合同正文": contract_total or "未提取", "TA": ta_total or "未提取", "合同包": package_total or "未提取", "CQP": cqp_total or "未提取"},
+        quantity_evidence,
     ))
 
     contract_warranty = contract.get("warranty", {})
@@ -1497,6 +1663,7 @@ def build_review_items(
 
     cqp_configs, ta_configs = cqp.get("configurations", []), ta.get("configurations", [])
     config_subitems: List[Dict[str, Any]] = []
+    config_evidence: List[Dict[str, Any]] = []
     explicit_conflicts: List[str] = []
     unresolved: List[str] = []
     translation_matches: List[str] = []
@@ -1513,7 +1680,8 @@ def build_review_items(
         candidate = match.get("ta") or match.get("conflict") or {}
         if match.get("matched"):
             sub_status, sub_state = "PASS", "MATCH"
-            matched_keys.add((candidate.get("model"), candidate.get("code")))
+            if candidate.get("model") and candidate.get("code"):
+                matched_keys.add((candidate.get("model"), candidate.get("code")))
             if match.get("translation_only"):
                 translation_matches.append(f"{model}:{code_value}")
         elif match.get("conflict"):
@@ -1522,20 +1690,29 @@ def build_review_items(
         else:
             sub_status, sub_state = "UNDETERMINED", "EXTRACTION_FAILED"
             unresolved.append(f"{model}:{code_value}")
-        config_subitems.append({
-            "id": "config_" + re.sub(r"[^a-z0-9]+", "_", (model + "_" + code_value).lower()).strip("_"),
-            "title": f"{model} · {code_value}",
-            "status": sub_status,
-            "decision_state": sub_state,
-            "summary": (
-                "CQP与TA代码一致。" if match.get("method") == "相同代码" else
-                "中英文/代码别名可映射为同一配置。" if match.get("matched") else
-                f"同类配置明确冲突：CQP {code_value} / TA {candidate.get('code')}。" if match.get("conflict") else
-                "CQP配置未找到可信TA对应项；当前按证据不足处理，不直接判定冲突。"
-            ),
-            "values": {"CQP代码": code_value, "CQP描述": config.get("description") or "", "TA代码": candidate.get("code") or "未匹配", "TA描述": candidate.get("description") or "未匹配", "匹配方式": match.get("method")},
-            "evidence": _valid_evidence([_evidence(cqp_pdf, "cqp", f"{model} {code_value}", [code_value], page_hint=config.get("page")), _evidence(ta_pdf, "ta", f"{model} 对应配置", [candidate.get("code", ""), candidate.get("description", ""), *aliases_for_code(code_value, str(config.get("description", "")))])]),
-        })
+
+        evidence = _valid_evidence([
+            _evidence(cqp_pdf, "cqp", f"{model} {code_value}", [code_value], page_hint=config.get("page")),
+            _evidence(ta_pdf, "ta", f"{model} 对应配置", [candidate.get("code", ""), candidate.get("description", ""), *aliases_for_code(code_value, str(config.get("description", "")))]),
+        ])
+        config_evidence.extend(evidence)
+        # Unresolved options are already listed once in the parent card's 待补证 field.
+        # Do not render a second child card that repeats the identical issue.
+        if sub_status != "UNDETERMINED":
+            config_subitems.append({
+                "id": "config_" + re.sub(r"[^a-z0-9]+", "_", (model + "_" + code_value).lower()).strip("_"),
+                "title": f"{model} · {code_value}",
+                "status": sub_status,
+                "decision_state": sub_state,
+                "summary": (
+                    "CQP与TA代码一致。" if match.get("method") == "相同代码" else
+                    "中英文/代码别名可映射为同一配置。" if match.get("matched") else
+                    f"同类配置明确冲突：CQP {code_value} / TA {candidate.get('code')}。"
+                ),
+                "values": {"CQP代码": code_value, "CQP描述": config.get("description") or "", "TA代码": candidate.get("code") or "未匹配", "TA描述": candidate.get("description") or "未匹配", "匹配方式": match.get("method")},
+                "evidence": evidence,
+            })
+
     cqp_keys = {(item.get("model"), item.get("code")) for item in cqp_configs}
     ta_only = sorted({
         (str(item.get("model", "")), str(item.get("code", "")))
@@ -1565,7 +1742,7 @@ def build_review_items(
     items.append(_item(
         "configuration_consistency", CATEGORY_PRODUCT, "CQP与TA技术配置", config_status, config_severity, config_summary,
         {"明确冲突": "、".join(explicit_conflicts) or "无", "待补证": "、".join(unresolved) or "无", "翻译/别名一致": "、".join(translation_matches) or "无", "商务项备注": "、".join(commercial_notes) or "无", "TA附加项": "、".join(f"{m}:{c}" for m, c in ta_only) or "无", "知识库来源": "、".join(get_contract_review_knowledge().source_files) or "内置fallback"},
-        [entry for sub in config_subitems for entry in sub["evidence"]], config_subitems,
+        config_evidence, config_subitems,
     ))
 
     naming_warning = bool(ta.get("lps_name_in_supply") and ta.get("lps_name_in_parameters") and ta.get("lps_name_in_supply") != ta.get("lps_name_in_parameters"))
@@ -1598,20 +1775,27 @@ def build_review_items(
         [_evidence(contract_pdf, "contract", "合同付款条件", [contract.get("payment_terms", {}).get("raw", ""), "付款条件"]), _evidence(cqp_pdf, "cqp", "CQP付款条件", [cqp.get("payment_terms", {}).get("raw", ""), "付款条件"])],
     ))
 
-    schedule, q_weeks = contract.get("delivery_schedule", []), int(cqp.get("delivery_weeks", 0) or 0)
-    contract_weeks = sorted({int(entry.get("weeks", 0)) for entry in schedule if entry.get("weeks")})
+    schedule = contract.get("delivery_schedule", [])
+    direct_weeks = int(contract.get("delivery_weeks", 0) or 0)
+    q_weeks = int(cqp.get("delivery_weeks", 0) or 0)
+    schedule_weeks = sorted({int(entry.get("weeks", 0)) for entry in schedule if entry.get("weeks")})
+    contract_weeks = [direct_weeks] if direct_weeks else schedule_weeks
+    contract_trigger = str(contract.get("delivery_trigger", "") or "")
+    cqp_trigger = str(cqp.get("delivery_trigger", "") or "")
     if not contract_weeks:
         delivery_status, delivery_severity, delivery_summary = "UNDETERMINED", "blocker", "合同交期无法提取，按抽取失败处理。"
     elif not q_weeks:
         delivery_status, delivery_severity, delivery_summary = "WARNING", "warning", "CQP交期未提取；BT09按合同交期填写。"
-    elif any(week != q_weeks for week in contract_weeks) or (contract.get("delivery_trigger") and cqp.get("delivery_trigger") and contract.get("delivery_trigger") != cqp.get("delivery_trigger")):
+    elif any(week != q_weeks for week in contract_weeks) or (contract_trigger and cqp_trigger and contract_trigger != cqp_trigger):
         delivery_status, delivery_severity, delivery_summary = "WARNING", "warning", "合同与CQP交期或起算条件不同；非阻塞，BT09以合同为准。"
     else:
         delivery_status, delivery_severity, delivery_summary = "PASS", "info", "合同与CQP交期一致；BT09以合同为准。"
+    contract_display = f"{direct_weeks}周" if direct_weeks else "；".join(f"{entry.get('model')} {entry.get('weeks')}周" for entry in schedule)
     items.append(_item(
         "delivery_period", CATEGORY_OTHER, "交付周期与起算条件", delivery_status, delivery_severity, delivery_summary,
-        {"合同": "；".join(f"{entry.get('model')} {entry.get('weeks')}周" for entry in schedule) or "未提取", "合同起算": contract.get("delivery_trigger") or "未提取", "CQP": cqp.get("delivery_time") or "未提取", "CQP起算": cqp.get("delivery_trigger") or "未提取", "BT09来源": "合同"},
-        _evidence_many(contract_pdf, "contract", "合同交付周期", [str(week) + "周" for week in contract_weeks] + [contract.get("delivery_trigger", "")]) + _evidence_many(cqp_pdf, "cqp", "CQP交付周期", [cqp.get("delivery_time", "")]),
+        {"合同": contract_display or "未提取", "合同起算": contract_trigger or "未提取", "CQP": cqp.get("delivery_time") or "未提取", "CQP起算": cqp_trigger or "未提取", "BT09来源": "合同"},
+        _evidence_many(contract_pdf, "contract", "合同交付周期", [str(week) + "周" for week in contract_weeks] + [contract_trigger])
+        + _evidence_many(cqp_pdf, "cqp", "CQP交付周期", [cqp.get("delivery_time", "")]),
     ))
 
     incoterm = _infer_incoterm(contract, cqp)

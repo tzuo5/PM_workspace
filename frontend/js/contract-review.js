@@ -7,6 +7,8 @@
 (function () {
     "use strict";
 
+    // CONTRACT_REVIEW_M4367_PATCH_V3: frontend
+
     var CATEGORY_ORDER = ["customer_information", "product_information", "other_information"];
     var CATEGORY_FALLBACK = {
         customer_information: "客户信息",
@@ -280,10 +282,18 @@
             var scaleY = viewport.height / pageHeight;
             (evidence.rects || []).forEach(function (rect) {
                 if (!Array.isArray(rect) || rect.length !== 4) return;
-                var left = Number(rect[0]) * scaleX;
-                var top = Number(rect[1]) * scaleY;
-                var width = Math.max(2, (Number(rect[2]) - Number(rect[0])) * scaleX);
-                var height = Math.max(4, (Number(rect[3]) - Number(rect[1])) * scaleY);
+                var rawLeft = Number(rect[0]) * scaleX;
+                var rawTop = Number(rect[1]) * scaleY;
+                var rawRight = Number(rect[2]) * scaleX;
+                var rawBottom = Number(rect[3]) * scaleY;
+                var paddingX = 4;
+                var paddingY = 3;
+                var left = Math.max(0, rawLeft - paddingX);
+                var top = Math.max(0, rawTop - paddingY);
+                var right = Math.min(viewport.width, rawRight + paddingX);
+                var bottom = Math.min(viewport.height, rawBottom + paddingY);
+                var width = Math.max(4, right - left);
+                var height = Math.max(6, bottom - top);
                 var marker = document.createElement("div");
                 marker.className = "cr-highlight-rect " + (highlight.className || "") + " pulse";
                 marker.style.left = left + "px";
@@ -671,9 +681,10 @@
         var notice = this.container.querySelector('[data-role="ai-notice"]');
         var llm = this.reviewResult.llm_review || {};
         if (llm.error) {
+            var detail = llm.user_message || "AI 审核未能生成可解析结果。";
             notice.hidden = false;
             notice.className = "cr-ai-notice cr-ai-notice--error";
-            notice.textContent = "AI 审核不可用；规则检查和 PDF 定位仍可使用。";
+            notice.textContent = "AI：" + detail + " 规则检查和 PDF 定位仍可使用。";
         } else if (llm.summary) {
             notice.hidden = false;
             notice.className = "cr-ai-notice";

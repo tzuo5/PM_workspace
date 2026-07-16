@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# CONTRACT_REVIEW_M4367_PATCH_V3: regression-tests
+
 import csv
 import os
 import tempfile
@@ -141,22 +143,20 @@ class EvidenceFirstRegressionTests(unittest.TestCase):
         self.assertTrue(result["complete"])
         self.assertEqual(result["percentages"], [10.0, 40.0, 50.0])
 
-    def test_model_extraction_failure_does_not_create_quantity_cascade_blockers(self) -> None:
-        contract_pdf = ParsedPDF("contract.pdf", [ParsedPage(1, 612, 792, "销售合同")])
-        cqp_pdf = ParsedPDF("cqp.pdf", [ParsedPage(1, 612, 792, "报价")])
-        ta_pdf = ParsedPDF("ta.pdf", [ParsedPage(1, 612, 792, "Technical Agreement 技术协议书")])
+    def test_ta_model_evidence_satisfies_contract_package_without_cascade_blockers(self) -> None:
+        contract_pdf = ParsedPDF("contract.pdf", [ParsedPage(1, 612, 792, "销售合同 M2026-0001")])
+        cqp_pdf = ParsedPDF("cqp.pdf", [ParsedPage(1, 612, 792, "报价 IRB 2600-20/1.65")])
+        ta_pdf = ParsedPDF("ta.pdf", [ParsedPage(1, 612, 792, "Technical Agreement 技术协议书 IRB 2600-20/1.65")])
         documents = DocumentSet(contract_pdf, contract_pdf, cqp_pdf, ta_pdf, False)
         model = "IRB 2600-20/1.65"
-        contract = {"products": [], "total_qty": 0, "attachments": {}, "payment_terms": {}, "warranty": {}}
+        contract = {"contract_number": "M2026-0001", "products": [], "total_qty": 0, "attachments": {}, "payment_terms": {}, "warranty": {}}
         cqp = {"products": [{"model": model, "qty": 2}], "total_qty": 2, "configurations": []}
-        ta = {"products": [{"model": model, "qty": 2}], "total_qty": 2, "configurations": []}
+        ta = {"contract_number": "M2026-0001", "products": [{"model": model, "qty": 2}], "total_qty": 2, "configurations": []}
         items = build_review_items(documents, contract, cqp, ta)
         by_id = {item["id"]: item for item in items}
-        self.assertEqual(by_id["product_models"]["status"], "UNDETERMINED")
-        self.assertEqual(by_id["product_models"]["severity"], "blocker")
-        self.assertEqual(by_id["product_quantities"]["status"], "UNDETERMINED")
-        self.assertEqual(by_id["product_quantities"]["severity"], "warning")
-        self.assertEqual(by_id["total_quantity"]["severity"], "warning")
+        self.assertEqual(by_id["product_models"]["status"], "PASS")
+        self.assertEqual(by_id["product_quantities"]["status"], "PASS")
+        self.assertEqual(by_id["total_quantity"]["status"], "PASS")
 
     def test_ddp_ship_to_uses_one_complete_source_tuple(self) -> None:
         result = _infer_incoterm(
@@ -176,6 +176,29 @@ class EvidenceFirstRegressionTests(unittest.TestCase):
         self.assertEqual(result["ship_to_address"], "End Customer Road")
         self.assertEqual(result["ship_to_source"], "合同最终用户")
 
+    def test_multiline_annex_two_beats_table_of_contents(self) -> None:
+        result = _extract_payment_terms(
+            "目录\n附件二 付款方式\n附件三 诚信条款\n"
+            "正文结束\n附件二\n付款方式（电汇）\n付款条件：\n"
+            "1）合同总价的百分之十，签订合同后电汇。\n"
+            "2）合同总价的百分之四十，发货前电汇。\n"
+            "3）合同总价的百分之五十，发货前银行承兑汇票。卖方收到全款且发货后开具发票。\n"
+            "附件三\n诚信条款"
+        )
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["percentages"], [10.0, 40.0, 50.0])
+        self.assertIn("银行承兑汇票", result["raw"])
+
+    def test_contract_level_delivery_is_extracted_without_model_on_page(self) -> None:
+        parsed = ParsedPDF(
+            "contract.pdf",
+            [ParsedPage(2, 612, 792, "2.2 发运时间：\n合同生效且收到预付款后__6_____周\n分批发货：")],
+        )
+        result = extract_contract(parsed)
+        self.assertEqual(result["delivery_weeks"], 6)
+        self.assertEqual(result["delivery_trigger"], "合同生效且收到预付款后")
+        self.assertEqual(result["extraction_state"]["delivery_period"], "EXTRACTED")
+
 class LlmGuardrailTests(unittest.TestCase):
     @patch("services.contract_llm_review.call_llm_chat")
     def test_llm_cannot_override_rule_engine_blocker(self, mocked_call) -> None:
@@ -188,6 +211,22 @@ class LlmGuardrailTests(unittest.TestCase):
         )
         self.assertEqual(result["overall_assessment"], "Blocked")
 
+
+    @patch("services.contract_llm_review.call_llm_chat")
+    def test_llm_retries_when_finish_reason_is_length(self, mocked_call) -> None:
+        mocked_call.side_effect = [
+            {"content": '{"overall_assessment":"Blocked"', "finish_reason": "length", "usage": {}},
+            {"content": '{"overall_assessment":"Blocked","summary":"已完成","confidence":0.9}', "finish_reason": "stop", "usage": {}},
+        ]
+        result = run_llm_contract_review(
+            {}, {}, {}, {},
+            [{"check_name": "付款", "status": "MISMATCH", "detail": "冲突", "is_blocker": True}],
+            {}, {}, {},
+            config={"api_key": "test-key", "max_tokens": 500},
+        )
+        self.assertEqual(result["overall_assessment"], "Blocked")
+        self.assertEqual(result["retry_count"], 1)
+        self.assertEqual(mocked_call.call_count, 2)
 
 class ReviewPolicyTests(unittest.TestCase):
     def test_generic_model_is_not_limited_to_sample_models(self) -> None:

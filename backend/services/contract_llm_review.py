@@ -8,8 +8,10 @@ cannot override deterministic results or invent missing document facts.
 
 from __future__ import annotations
 
+# CONTRACT_REVIEW_M4367_PATCH_V3: contract-llm
+
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from services.contract_review_knowledge import get_contract_review_knowledge
 from services.llm_review import (
@@ -197,30 +199,115 @@ def run_llm_contract_review(
     financial_result: Dict[str, Any],
     config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    cfg = config or load_llm_config()
+    cfg = dict(config or load_llm_config())
     api_key = to_str(cfg.get("api_key", "")).strip()
     if not api_key:
         return {
             "error": "DeepSeek API Key 未配置。请在 backend/config/llm_config.json 中设置 api_key。",
+            "error_code": "API_KEY_MISSING",
+            "user_message": "DeepSeek API Key 未配置。",
             "overall_assessment": "Unknown",
             "summary": "（AI 审核未执行：API Key 未配置）",
         }
+
+    cfg["max_tokens"] = max(1800, int(cfg.get("max_tokens", 0) or 0))
+    messages = build_contract_review_prompt(
+        contract_data, cqp_data, ta_data, incoterm_result,
+        consistency_results, warranty_result, config_result, financial_result,
+    )
+
+    def request(local_cfg: Dict[str, Any], local_messages: List[Dict[str, str]]) -> Dict[str, Any]:
+        response = call_llm_chat(local_cfg, local_messages, return_metadata=True)
+        if isinstance(response, str):
+            return {"content": response, "finish_reason": "", "usage": {}, "model": local_cfg.get("model", "")}
+        return response if isinstance(response, dict) else {"content": to_str(response), "finish_reason": "", "usage": {}}
+
+    def looks_truncated(content: str, finish_reason: str) -> bool:
+        stripped = content.strip()
+        if finish_reason.lower() == "length":
+            return True
+        if stripped.count("{") > stripped.count("}") or stripped.count("[") > stripped.count("]"):
+            return True
+        return bool(stripped.startswith(("{", "```json")) and not stripped.endswith(("}", "```")))
+
+    def classify_exception(exc: Exception) -> Tuple[str, str]:
+        text = str(exc)
+        if "401" in text or "认证失败" in text:
+            return "API_AUTH_FAILED", "DeepSeek API 认证失败，请检查 API Key。"
+        if "402" in text or "余额不足" in text:
+            return "API_BALANCE_INSUFFICIENT", "DeepSeek 账户余额不足。"
+        if "无法连接" in text or "timed out" in text.lower() or "timeout" in text.lower():
+            return "API_NETWORK_ERROR", "无法连接 DeepSeek API 或请求超时。"
+        return "API_REQUEST_FAILED", "DeepSeek 请求失败。"
+
+    metadata: Dict[str, Any] = {}
+    content = ""
+    retry_count = 0
     try:
-        messages = build_contract_review_prompt(
-            contract_data, cqp_data, ta_data, incoterm_result,
-            consistency_results, warranty_result, config_result, financial_result,
-        )
-        parsed = extract_json_object(call_llm_chat(cfg, messages))
+        metadata = request(cfg, messages)
+        content = to_str(metadata.get("content", ""))
+        finish_reason = to_str(metadata.get("finish_reason", ""))
+        try:
+            parsed = extract_json_object(content)
+        except Exception as first_parse_error:
+            if not looks_truncated(content, finish_reason):
+                return {
+                    "error": str(first_parse_error),
+                    "error_code": "LLM_INVALID_JSON",
+                    "user_message": "DeepSeek 已返回内容，但不是完整有效的 JSON。",
+                    "finish_reason": finish_reason,
+                    "usage": metadata.get("usage", {}),
+                    "overall_assessment": "Unknown",
+                    "summary": "（AI 审核失败：模型输出格式无效）",
+                }
+            retry_count = 1
+            retry_cfg = dict(cfg)
+            retry_cfg["max_tokens"] = max(3200, min(6000, int(cfg["max_tokens"]) * 2))
+            retry_messages = [dict(message) for message in messages]
+            retry_messages[-1]["content"] += (
+                "\n\n上一次输出因长度限制被截断。请压缩措辞，严格返回完整JSON；"
+                "每个数组最多5项，summary最多4句，不要输出Markdown代码围栏。"
+            )
+            metadata = request(retry_cfg, retry_messages)
+            content = to_str(metadata.get("content", ""))
+            finish_reason = to_str(metadata.get("finish_reason", ""))
+            try:
+                parsed = extract_json_object(content)
+            except Exception as second_parse_error:
+                code = "LLM_OUTPUT_TRUNCATED" if looks_truncated(content, finish_reason) else "LLM_INVALID_JSON"
+                message = (
+                    "DeepSeek 输出达到长度上限，自动重试后仍被截断。"
+                    if code == "LLM_OUTPUT_TRUNCATED" else
+                    "DeepSeek 已返回内容，但自动重试后仍不是有效 JSON。"
+                )
+                return {
+                    "error": str(second_parse_error),
+                    "error_code": code,
+                    "user_message": message,
+                    "finish_reason": finish_reason,
+                    "usage": metadata.get("usage", {}),
+                    "retry_count": retry_count,
+                    "overall_assessment": "Unknown",
+                    "summary": "（AI 审核失败：模型输出不完整）",
+                }
+
         normalized = normalize_contract_llm_response(parsed)
-        # Enforce rule-engine authority even when the model ignores the prompt.
         has_blocker = any(bool(check.get("is_blocker")) for check in consistency_results)
         has_notes = any(str(check.get("status", "")).upper() in {"WARNING", "UNDETERMINED", "MISMATCH"} for check in consistency_results)
         normalized["overall_assessment"] = "Blocked" if has_blocker else ("Pass with notes" if has_notes else "Pass")
         normalized["knowledge_sources"] = list(get_contract_review_knowledge().source_files)
+        normalized["finish_reason"] = to_str(metadata.get("finish_reason", ""))
+        normalized["usage"] = metadata.get("usage", {})
+        normalized["retry_count"] = retry_count
         return normalized
     except Exception as exc:
+        error_code, user_message = classify_exception(exc)
         return {
             "error": str(exc),
+            "error_code": error_code,
+            "user_message": user_message,
+            "finish_reason": to_str(metadata.get("finish_reason", "")),
+            "usage": metadata.get("usage", {}) if isinstance(metadata, dict) else {},
             "overall_assessment": "Unknown",
             "summary": f"（AI 审核失败：{truncate(str(exc), 200)}）",
         }

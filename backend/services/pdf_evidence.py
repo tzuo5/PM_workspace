@@ -89,6 +89,109 @@ def parse_pdf_with_evidence(filepath: str) -> ParsedPDF:
     return _parse_with_pdfplumber(filepath)
 
 
+# CONTRACT_REVIEW_M4367_PATCH_V3: selective-ocr
+def ocr_pdf_pages(
+    filepath: str,
+    page_numbers: Iterable[int],
+    *,
+    lang: str = "chi_sim+eng",
+    dpi: int = 220,
+) -> Dict[int, str]:
+    """OCR selected pages only; return an empty mapping when OCR is unavailable.
+
+    Native PDF text remains the primary source. This optional fallback is used
+    only after deterministic extraction has failed, so normal text PDFs do not
+    pay the OCR cost or suffer OCR-induced regressions.
+    """
+    source_path = str(filepath or "").split("#", 1)[0]
+    requested = sorted({int(page) for page in page_numbers if int(page) > 0})
+    if not source_path or not requested:
+        return {}
+
+    try:
+        import fitz  # PyMuPDF
+    except Exception:
+        return {}
+
+    try:
+        document = fitz.open(source_path)
+    except Exception:
+        return {}
+
+    output: Dict[int, str] = {}
+    scale = max(1.0, float(dpi) / 72.0)
+    try:
+        for page_num in requested:
+            if page_num > len(document):
+                continue
+            try:
+                page = document[page_num - 1]
+                pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+                png_bytes = pixmap.tobytes("png")
+            except Exception:
+                continue
+
+            text = ""
+            try:
+                import io
+                from PIL import Image
+                import pytesseract
+
+                image = Image.open(io.BytesIO(png_bytes))
+                try:
+                    text = pytesseract.image_to_string(image, lang=lang, config="--psm 6")
+                except Exception:
+                    text = pytesseract.image_to_string(image, lang="eng", config="--psm 6")
+            except Exception:
+                text = ""
+
+            if not text.strip():
+                try:
+                    import shutil
+                    import subprocess
+                    import tempfile
+                    from pathlib import Path
+
+                    executable = shutil.which("tesseract")
+                    if executable:
+                        with tempfile.TemporaryDirectory(prefix="pm_contract_ocr_") as temp_dir:
+                            image_path = Path(temp_dir) / f"page_{page_num}.png"
+                            image_path.write_bytes(png_bytes)
+                            command = [executable, str(image_path), "stdout", "-l", lang, "--psm", "6"]
+                            completed = subprocess.run(
+                                command,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True,
+                                encoding="utf-8",
+                                errors="replace",
+                                timeout=90,
+                                check=False,
+                            )
+                            if completed.returncode != 0 and lang != "eng":
+                                command[4] = "eng"
+                                completed = subprocess.run(
+                                    command,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    text=True,
+                                    encoding="utf-8",
+                                    errors="replace",
+                                    timeout=90,
+                                    check=False,
+                                )
+                            if completed.returncode == 0:
+                                text = completed.stdout
+                except Exception:
+                    text = ""
+
+            if text.strip():
+                output[page_num] = text.strip()
+    finally:
+        document.close()
+    return output
+
+
 def _parse_with_pdfplumber(filepath: str) -> ParsedPDF:
     result = ParsedPDF(filepath=filepath)
     try:
