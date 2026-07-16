@@ -10,13 +10,16 @@ from services.contract_review import (
     DocumentSet,
     _amount_status,
     _canonical_model,
+    _extract_configurations,
     _extract_cqp_products,
+    _extract_model_quantities,
     _extract_payment_terms,
     _extract_warranty_clause,
     _find_ta_start,
     _infer_incoterm,
     _match_customer_master,
     build_review_items,
+    extract_contract,
 )
 from services.contract_llm_review import run_llm_contract_review
 from services.pdf_evidence import ParsedPDF, ParsedPage, TextSpan, find_text_spans, normalize_for_match
@@ -75,6 +78,103 @@ class ContractExtractionTests(unittest.TestCase):
         self.assertEqual(products[0]["item_code"], "3HAC092345-001")
         self.assertAlmostEqual(products[0]["line_total"], 303869.03)
 
+
+# CONTRACT_REVIEW_EVIDENCE_PATCH_V2
+class EvidenceFirstRegressionTests(unittest.TestCase):
+    def test_chinese_adjacent_model_and_explicit_quantity_are_extracted(self) -> None:
+        parsed = ParsedPDF(
+            "contract.pdf",
+            [ParsedPage(1, 612, 792, "供货范围\n32 台IRB 1200-7/0.7 Gen2\n最大负载 20 kg\n工作范围 60 mm")],
+        )
+        self.assertEqual(_extract_model_quantities(parsed), {"IRB 1200-7/0.7 Gen2": 32})
+
+    def test_specification_numbers_are_not_guessed_as_quantity(self) -> None:
+        parsed = ParsedPDF(
+            "ta.pdf",
+            [ParsedPage(1, 612, 792, "IRB 1200-7/0.7 Gen2\n最大负载 20 kg\n工作范围 60 mm\n防护等级 1")],
+        )
+        self.assertEqual(_extract_model_quantities(parsed), {})
+
+    def test_configuration_parser_rejects_dates_voltage_and_cross_page_carryover(self) -> None:
+        parsed = ParsedPDF(
+            "ta.pdf",
+            [
+                ParsedPage(1, 612, 792, "IRB 2600-20/1.65\n配置清单\n2026-01 日期\n220-230 V 电压\n3000-1 Controller"),
+                ParsedPage(2, 612, 792, "3016-3 30m cable"),
+            ],
+        )
+        configs = _extract_configurations(parsed, "ta")
+        self.assertEqual([(item["model"], item["code"]) for item in configs], [("IRB 2600-20/1.65", "3000-1")])
+
+    def test_template_underscores_do_not_break_money_vat_or_delivery(self) -> None:
+        parsed = ParsedPDF(
+            "contract.pdf",
+            [
+                ParsedPage(
+                    1,
+                    612,
+                    792,
+                    "销售合同 M2026-0001\n"
+                    "买方：Buyer Co 地址：Buyer Road\n卖方：ABB（上海）机器人投资有限公司 地址：Shanghai\n"
+                    "32 台IRB 1200-7/0.7 Gen2 发货时间：__8___周\n"
+                    "不含增值税总额为 RMB:__6,200.00\n"
+                    "含增值税总额为 RMB:__7,006.00\n"
+                    "增值税税率：_13%\n"
+                    "附件二 付款条件\n1）合同总价的100%，合同生效后电汇。\n附件三 诚信条款",
+                )
+            ],
+        )
+        result = extract_contract(parsed)
+        self.assertEqual(result["untaxed_amount"], 6200.0)
+        self.assertEqual(result["tax_included_amount"], 7006.0)
+        self.assertEqual(result["vat_rate"], 0.13)
+        self.assertEqual(result["delivery_schedule"][0]["weeks"], 8)
+
+    def test_payment_parser_excludes_penalty_and_tax_percentages(self) -> None:
+        result = _extract_payment_terms(
+            "附件二 付款条件\n"
+            "1）合同总价的10%，合同生效后电汇。\n"
+            "2）合同总价的40%，发货前电汇。\n"
+            "3）合同总价的50%，验收后电汇。\n"
+            "违约责任\n违约金为12%。\n增值税率13%。"
+        )
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["percentages"], [10.0, 40.0, 50.0])
+
+    def test_model_extraction_failure_does_not_create_quantity_cascade_blockers(self) -> None:
+        contract_pdf = ParsedPDF("contract.pdf", [ParsedPage(1, 612, 792, "销售合同")])
+        cqp_pdf = ParsedPDF("cqp.pdf", [ParsedPage(1, 612, 792, "报价")])
+        ta_pdf = ParsedPDF("ta.pdf", [ParsedPage(1, 612, 792, "Technical Agreement 技术协议书")])
+        documents = DocumentSet(contract_pdf, contract_pdf, cqp_pdf, ta_pdf, False)
+        model = "IRB 2600-20/1.65"
+        contract = {"products": [], "total_qty": 0, "attachments": {}, "payment_terms": {}, "warranty": {}}
+        cqp = {"products": [{"model": model, "qty": 2}], "total_qty": 2, "configurations": []}
+        ta = {"products": [{"model": model, "qty": 2}], "total_qty": 2, "configurations": []}
+        items = build_review_items(documents, contract, cqp, ta)
+        by_id = {item["id"]: item for item in items}
+        self.assertEqual(by_id["product_models"]["status"], "UNDETERMINED")
+        self.assertEqual(by_id["product_models"]["severity"], "blocker")
+        self.assertEqual(by_id["product_quantities"]["status"], "UNDETERMINED")
+        self.assertEqual(by_id["product_quantities"]["severity"], "warning")
+        self.assertEqual(by_id["total_quantity"]["severity"], "warning")
+
+    def test_ddp_ship_to_uses_one_complete_source_tuple(self) -> None:
+        result = _infer_incoterm(
+            {
+                "incoterm_detection": {"selected": "DDP", "conflict": False},
+                "delivery_location": "Customer Destination",
+                "ship_to_name": "Incomplete Ship-to",
+                "ship_to_address": "",
+                "end_customer_name": "End Customer Co",
+                "end_customer_address": "End Customer Road",
+                "buyer_name": "Buyer Co",
+                "buyer_address": "Buyer Road",
+            },
+            {"delivery_term": "DDP Customer Destination"},
+        )
+        self.assertEqual(result["ship_to_name"], "End Customer Co")
+        self.assertEqual(result["ship_to_address"], "End Customer Road")
+        self.assertEqual(result["ship_to_source"], "合同最终用户")
 
 class LlmGuardrailTests(unittest.TestCase):
     @patch("services.contract_llm_review.call_llm_chat")
