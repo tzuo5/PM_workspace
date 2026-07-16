@@ -458,7 +458,11 @@ def handle_contract_review(handler: PMRequestHandler) -> Dict[str, Any]:
 
         # Run review with explicit file roles
         result = run_review(pdf_paths, file_roles=file_roles)
+        # `ok` means the HTTP/pipeline operation completed, not that the legal review passed.
         result["ok"] = True
+        result.setdefault("pipeline_completed", True)
+        result["review_passed"] = result.get("conclusion") == "Pass"
+        result["review_blocked"] = result.get("conclusion") == "Blocked"
         return result
     finally:
         if temp_dir:

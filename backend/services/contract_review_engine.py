@@ -108,6 +108,30 @@ def _find_ta_start(parsed: ParsedPDF) -> Optional[int]:
     return None
 
 
+# PM_TA_RANGE_PATCH_20260716
+def _find_ta_end(parsed: ParsedPDF, start_page: int) -> int:
+    """Return the first page after an embedded TA.
+
+    Prefer the TA's own “Page 1 of N” pagination. Fall back to the first integrity
+    appendix page outside Doc No. 3.02.F03. This prevents integrity pages from
+    being counted as TA pages or contaminating model/configuration extraction.
+    """
+    max_page = max((page.page_num for page in parsed.pages), default=start_page)
+    cover = next((page for page in parsed.pages if page.page_num == start_page), None)
+    if cover:
+        match = re.search(r"Page\s*1\s*of\s*(\d{1,3})", cover.text or "", re.I)
+        if match:
+            expected = int(match.group(1))
+            if 1 <= expected <= 100:
+                return min(max_page + 1, start_page + expected)
+    for page in parsed.pages:
+        if page.page_num <= start_page:
+            continue
+        key = match_key(page.text)
+        if "诚信条款" in page.text and "docno3.02.f03" not in key:
+            return page.page_num
+    return max_page + 1
+
 def _resolve_documents(
     parsed_by_path: Dict[str, ParsedPDF],
     file_roles: Optional[Dict[str, str]],
@@ -128,7 +152,8 @@ def _resolve_documents(
 
     for parsed in parsed_by_path.values():
         text_key = match_key(parsed.full_text)
-        if contract is None and "销售合同" in parsed.full_text and re.search(r"[MK]\s*\d{4}\s*-\s*\d{4}", parsed.full_text):
+        compact = re.sub(r"\s+", "", parsed.full_text or "")
+        if contract is None and "销售合同" in parsed.full_text and re.search(r"[MK]\d{4}-\d{4}", compact, re.I):
             contract = parsed
         if cqp is None and re.search(r"CQ\d{7}", parsed.full_text) and ("报价" in parsed.full_text or "quotation" in text_key):
             cqp = parsed
@@ -140,13 +165,15 @@ def _resolve_documents(
     if contract:
         ta_start = _find_ta_start(contract)
         if ta_start:
+            ta_end = _find_ta_end(contract, ta_start)
             contract_body = _slice_pdf(contract, (page for page in contract.pages if page.page_num < ta_start), "#contract")
             if ta is None:
-                ta_pages = [page for page in contract.pages if page.page_num >= ta_start]
+                ta_pages = [page for page in contract.pages if ta_start <= page.page_num < ta_end]
                 if ta_pages:
                     ta = _slice_pdf(contract, ta_pages, "#ta")
                     ta_embedded = True
     return DocumentSet(contract, contract_body, cqp, ta, ta_embedded)
+
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +327,7 @@ def _extract_contract_delivery(parsed: Optional[ParsedPDF]) -> Dict[str, Any]:
 
 
 def _looks_like_configuration_code(code: str, line: str, description: str) -> bool:
-    """Reject dates, contract numbers and physical ranges before comparison."""
+    """Reject dates, contract/model fragments, and physical ranges."""
     try:
         prefix_text, suffix_text = code.split("-", 1)
         prefix, suffix = int(prefix_text), int(suffix_text)
@@ -310,6 +337,8 @@ def _looks_like_configuration_code(code: str, line: str, description: str) -> bo
     normalized_line = _normalize_extraction_text(line)
     context = f"{normalized_line} {description}"
     if 1900 <= prefix <= 2099:
+        return False
+    if re.search(rf"(?:IRB\s*)?{prefix}\s*-\s*{suffix}\s*/\s*\d", context, re.I):
         return False
     if re.search(rf"[A-Za-z]\s*{re.escape(code)}", normalized_line):
         return False
@@ -327,6 +356,7 @@ def _looks_like_configuration_code(code: str, line: str, description: str) -> bo
     if 100 <= prefix <= 1000 and 100 <= suffix <= 1000 and re.search(physical_units, context, re.I):
         return False
     return True
+
 
 
 def _coherent_ship_to_tuple(
@@ -447,15 +477,12 @@ def _models_in_text(text: str) -> List[str]:
     return found
 
 
-def _extract_model_quantities(parsed: Optional[ParsedPDF]) -> Dict[str, int]:
-    """Extract quantities only from explicit, model-bound evidence.
-
-    Nearby specification numbers are intentionally ignored.  Ambiguous
-    top-confidence values produce no quantity rather than a guessed value.
-    """
+# PM_QUANTITY_EVIDENCE_PATCH_20260716
+def _extract_model_quantity_details(parsed: Optional[ParsedPDF]) -> Dict[str, Any]:
+    """Return selected quantities plus explicit within-document contradictions."""
     if parsed is None:
-        return {}
-    candidates: Dict[str, List[Tuple[int, int, int, str]]] = defaultdict(list)
+        return {"selected": {}, "candidates": {}, "conflicts": []}
+    candidates: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     spec_words = re.compile(
         r"负载|工作范围|重复定位|电压|频率|重量|速度|轴数|防护等级|payload|reach|range|"
         r"repeatability|voltage|frequency|weight|speed",
@@ -463,51 +490,61 @@ def _extract_model_quantities(parsed: Optional[ParsedPDF]) -> Dict[str, int]:
     )
     spec_unit = re.compile(r"^\s*(?:kg|g|mm|cm|m\b|N\b|Nm|kW|W\b|V\b|Hz|℃|°C|轴|级)", re.I)
 
+    def add(model: str, score: int, qty: int, page: int, line: str) -> None:
+        if 0 < qty < 1000:
+            candidates[model].append({"score": score, "qty": qty, "page": page, "line": _clean_inline(line)})
+
     for page in parsed.pages:
         page_text = _normalize_extraction_text(page.text)
         lines = [line.strip() for line in page_text.splitlines() if line.strip()]
         page_is_table = bool(re.search(r"供货范围|设备清单|机器人清单|产品清单|数量|qty|quantity", page_text, re.I))
-        for line in lines:
+        for index, line in enumerate(lines):
             for model_match in GENERIC_MODEL_PATTERN.finditer(line):
                 model = _canonical_model(model_match.group(0))
                 before, after = line[: model_match.start()], line[model_match.end() :]
-                occurrence: List[Tuple[int, int]] = []
-
                 before_match = re.search(r"(\d{1,4})\s*(?:台|套|pcs?|units?)\s*$", before, re.I)
                 if before_match:
-                    occurrence.append((100, int(before_match.group(1))))
-
-                labelled = re.search(
-                    r"(?:数量|qty|quantity)\s*[:：]?\s*(\d{1,4})(?:\s*(?:台|套|pcs?|units?))?",
-                    after[:160],
-                    re.I,
-                )
+                    add(model, 100, int(before_match.group(1)), page.page_num, line)
+                labelled = re.search(r"(?:数量|qty|quantity)\s*[:：]?\s*(\d{1,4})(?:\s*(?:台|套|pcs?|units?))?", after[:160], re.I)
                 if labelled:
-                    occurrence.append((100, int(labelled.group(1))))
-
+                    add(model, 100, int(labelled.group(1)), page.page_num, line)
                 unit_after = re.search(r"(?:^|[|｜:：,，;；])\s*(\d{1,4})\s*(?:台|套|pcs?|units?)\b", after[:160], re.I)
                 if unit_after:
-                    occurrence.append((95, int(unit_after.group(1))))
-
+                    add(model, 98, int(unit_after.group(1)), page.page_num, line)
+                for nearby in lines[index + 1 : index + 4]:
+                    nearby_qty = re.fullmatch(r"\s*(\d{1,4})\s*(?:台|套|pcs?|units?)\s*", nearby, re.I)
+                    if nearby_qty:
+                        add(model, 96, int(nearby_qty.group(1)), page.page_num, line + " | " + nearby)
+                        break
+                    if GENERIC_MODEL_PATTERN.search(nearby):
+                        break
                 if page_is_table and not spec_words.search(line):
                     table_qty = re.match(r"\s*(?:[|｜:：,，;；-]\s*)?(\d{1,4})(?![\d./-])", after)
                     if table_qty and not spec_unit.match(after[table_qty.end() :]):
-                        occurrence.append((70, int(table_qty.group(1))))
+                        add(model, 70, int(table_qty.group(1)), page.page_num, line)
 
-                valid = [(score, qty) for score, qty in occurrence if 0 < qty < 1000]
-                if valid:
-                    score, qty = max(valid, key=lambda item: item[0])
-                    candidates[model].append((score, qty, page.page_num, _clean_inline(line)))
-
-    result: Dict[str, int] = {}
+    selected: Dict[str, int] = {}
+    conflicts: List[Dict[str, Any]] = []
     for model, values in candidates.items():
-        top_score = max(item[0] for item in values)
-        top_values = [item[1] for item in values if item[0] == top_score]
+        top_score = max(item["score"] for item in values)
+        top_values = [item["qty"] for item in values if item["score"] == top_score]
         counts = {value: top_values.count(value) for value in set(top_values)}
         ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
-        if len(ranked) == 1 or ranked[0][1] > ranked[1][1]:
-            result[model] = ranked[0][0]
-    return result
+        if ranked:
+            selected[model] = ranked[0][0]
+        explicit_values = sorted({item["qty"] for item in values if item["score"] >= 96})
+        if len(explicit_values) > 1:
+            conflicts.append({
+                "model": model,
+                "values": explicit_values,
+                "selected": selected.get(model, 0),
+                "evidence": [item for item in values if item["score"] >= 96],
+            })
+    return {"selected": selected, "candidates": dict(candidates), "conflicts": conflicts}
+
+def _extract_model_quantities(parsed: Optional[ParsedPDF]) -> Dict[str, int]:
+    return dict(_extract_model_quantity_details(parsed).get("selected", {}))
+
 
 
 def _extract_cqp_products(parsed: Optional[ParsedPDF]) -> List[Dict[str, Any]]:
@@ -596,7 +633,6 @@ def _extract_delivery_schedule(parsed: Optional[ParsedPDF]) -> List[Dict[str, An
 def _extract_payment_terms(text: str) -> Dict[str, Any]:
     section_raw = _extract_payment_source(text)
     section = _normalize_extraction_text(section_raw)
-
     chinese_digits = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
 
     def chinese_percent(token: str) -> Optional[float]:
@@ -604,12 +640,8 @@ def _extract_payment_terms(text: str) -> Dict[str, Any]:
             return 100.0
         if "十" in token:
             left, _, right = token.partition("十")
-            tens = chinese_digits.get(left, 1) if left else 1
-            ones = chinese_digits.get(right, 0) if right else 0
-            return float(tens * 10 + ones)
-        if token in chinese_digits:
-            return float(chinese_digits[token])
-        return None
+            return float((chinese_digits.get(left, 1) if left else 1) * 10 + (chinese_digits.get(right, 0) if right else 0))
+        return float(chinese_digits[token]) if token in chinese_digits else None
 
     def percentages(clause: str) -> List[float]:
         arabic = [float(value) for value in re.findall(r"(\d+(?:[.]\d+)?)\s*%", clause)]
@@ -622,13 +654,26 @@ def _extract_payment_terms(text: str) -> Dict[str, Any]:
                 output.append(value)
         return output
 
-    clauses = [
-        _clean_inline(part)
-        for part in re.split(r"(?=(?:^|\n)\s*(?:\d+|[一二三四五六七八九十]+)[）).、])", section)
-        if _clean_inline(part)
-    ]
+    marker_pattern = re.compile(r"(?:^|[\n;；])\s*(?:\d+|[一二三四五六七八九十]+)\s*[）).、]", re.M)
+    starts = [0]
+    for match in marker_pattern.finditer(section):
+        start = match.start()
+        if start < len(section) and section[start] in "\n;；":
+            start += 1
+        if start > starts[-1]:
+            starts.append(start)
+    starts = sorted(set(starts))
+    clauses = []
+    for index, start in enumerate(starts):
+        end = starts[index + 1] if index + 1 < len(starts) else len(section)
+        clause = _clean_inline(section[start:end])
+        if clause:
+            clauses.append(clause)
     if len(clauses) <= 1:
-        clauses = [_clean_inline(line) for line in section.splitlines() if _clean_inline(line)]
+        percent_starts = [match.start() for match in re.finditer(r"(?:合同总价的)?(?:\d+(?:[.]\d+)?\s*%|百分之[零一二三四五六七八九十百]+)", section)]
+        if len(percent_starts) > 1:
+            starts = [0] + percent_starts[1:]
+            clauses = [_clean_inline(section[start:(starts[i + 1] if i + 1 < len(starts) else len(section))]) for i, start in enumerate(starts)]
 
     payment_hints = ("合同总价", "合同价款", "货款", "预付款", "付款", "支付", "电汇", "承兑", "发货", "交付", "验收", "开票")
     exclusions = ("违约金", "罚金", "罚款", "增值税率", "税率", "利息", "取消费", "赔偿")
@@ -641,11 +686,14 @@ def _extract_payment_terms(text: str) -> Dict[str, Any]:
         if any(word in clause for word in exclusions) and not any(word in clause for word in ("预付款", "付款", "货款", "合同总价")):
             continue
         values.extend(found)
+        trigger = _match_first(clause, [
+            r"((?:签订(?:本)?合同|合同生效|预付款(?:到账)?|设备发货|发货|交付|验收)[^，。；;]{0,60}?(?:前|后|时|内))"
+        ])
         for percent in found:
             installments.append({
                 "percent": int(percent) if percent.is_integer() else percent,
                 "text": clause,
-                "trigger": _match_first(clause, [r"(?:在|于)?(.{0,100}?(?:后|前|时|之日))"]),
+                "trigger": trigger,
                 "method": "银行承兑汇票" if "承兑" in clause else ("电汇" if "电汇" in clause else ""),
             })
 
@@ -670,23 +718,34 @@ def _extract_payment_terms(text: str) -> Dict[str, Any]:
     }
 
 
+
+# PM_CONFIG_SECTION_PATCH_20260716
+def _is_model_section_line(line: str, model_matches: Sequence[re.Match[str]], current_model: str = "") -> bool:
+    if len(model_matches) != 1:
+        return False
+    match = model_matches[0]
+    prefix = line[: match.start()].strip()
+    suffix = line[match.end() :].strip()
+    if not prefix and (not suffix or re.search(r"Industrial\s+robot|Industry\s+Robot|型(?:单臂)?工业机器人", suffix, re.I)):
+        return True
+    if re.fullmatch(r"(?:\d+[.)、]?\s*)?", prefix) and re.search(r"Industrial\s+robot|Industry\s+Robot|型(?:单臂)?工业机器人|system", suffix, re.I):
+        return True
+    if re.match(r"^\s*\d+[.)、]?\s*IRB\b", line, re.I):
+        return True
+    return not current_model and bool(re.match(r"^\s*IRB\b", line, re.I))
+
 def _extract_configurations(parsed: Optional[ParsedPDF], source_type: str) -> List[Dict[str, Any]]:
-    """Extract model-bound option rows while rejecting numeric noise."""
+    """Extract model-bound options with cross-page section continuity."""
     if parsed is None:
         return []
     code_pattern = re.compile(r"(?<![A-Za-z0-9.])(\d{3,4}-\d{1,4})(?![\d.])")
     configs: List[Dict[str, Any]] = []
+    current_model = ""
     for page in parsed.pages:
-        lines = [
-            _normalize_extraction_text(line).strip()
-            for line in page.text.splitlines()
-            if _normalize_extraction_text(line).strip()
-        ]
-        page_models = _models_in_text("\n".join(lines))
-        current_model = page_models[0] if len(page_models) == 1 else ""
+        lines = [_normalize_extraction_text(line).strip() for line in page.text.splitlines() if _normalize_extraction_text(line).strip()]
         for index, line in enumerate(lines):
             model_matches = list(GENERIC_MODEL_PATTERN.finditer(line))
-            if model_matches:
+            if _is_model_section_line(line, model_matches, current_model):
                 current_model = _canonical_model(model_matches[0].group(0))
             for match in code_pattern.finditer(line):
                 if any(model.start() <= match.start() < model.end() for model in model_matches):
@@ -723,27 +782,26 @@ def _extract_configurations(parsed: Optional[ParsedPDF], source_type: str) -> Li
     return unique
 
 
+
 def _model_section_text(parsed: Optional[ParsedPDF], model: str) -> str:
-    """Return bounded model sections instead of whole multi-model pages."""
+    """Return a model section while retaining continuation rows on later pages."""
     if parsed is None:
         return ""
     target = _canonical_model(model)
-    sections: List[str] = []
+    current_model = ""
+    sections: Dict[str, List[str]] = defaultdict(list)
     for page in parsed.pages:
-        lines = [_normalize_extraction_text(line) for line in page.text.splitlines()]
-        markers: List[Tuple[int, str]] = []
-        for index, line in enumerate(lines):
-            models = _models_in_text(line)
-            if models:
-                markers.append((index, models[0]))
-        for marker_index, (start_index, found_model) in enumerate(markers):
-            if found_model != target:
+        for raw_line in page.text.splitlines():
+            line = _normalize_extraction_text(raw_line).strip()
+            if not line:
                 continue
-            next_index = markers[marker_index + 1][0] if marker_index + 1 < len(markers) else len(lines)
-            start = max(0, start_index - 2)
-            end = min(next_index, start_index + 80)
-            sections.append("\n".join(lines[start:end]))
-    return "\n".join(sections)[:16000]
+            matches = list(GENERIC_MODEL_PATTERN.finditer(line))
+            if _is_model_section_line(line, matches, current_model):
+                current_model = _canonical_model(matches[0].group(0))
+            if current_model:
+                sections[current_model].append(line)
+    return "\n".join(sections.get(target, []))[:20000]
+
 
 
 def _extract_named_clause(text: str, clause_number: str, max_chars: int = 4000) -> str:
@@ -847,27 +905,82 @@ def _extract_warranty_codes_by_model(configs: Sequence[Dict[str, Any]]) -> Dict[
     return {model: data["code"] for model, data in _warranty_config_details(configs).items()}
 
 
-def _detect_contract_incoterm(page_text: str) -> Dict[str, Any]:
-    """Read checkbox state from the transport clause.
+# PM_WARRANTY_PROSE_PATCH_20260716
+def _warranty_details_from_document(parsed: Optional[ParsedPDF], configs: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
+    result = _warranty_config_details(configs)
+    models = {str(item.get("model", "")) for item in configs if item.get("model")}
+    if parsed:
+        models.update(_extract_model_quantities(parsed))
+        models.update(_models_in_text(parsed.full_text))
+    for model in models:
+        section = _model_section_text(parsed, model)
+        classification = _warranty_class_from_text(section)
+        if classification == "Unknown":
+            continue
+        current = result.get(model, {})
+        result[model] = {
+            "code": current.get("code", ""),
+            "description": current.get("description", "") or classification,
+            "classification": classification,
+        }
+    return result
 
-    Party wording has varied across prompt examples, so the legal trade basis is
-    derived from the unambiguous price term: 到货价 => DDP, 出厂价 => EXW.
-    Both option texts may coexist in OCR; only an actual checked marker selects
-    an option.
-    """
+def _detect_contract_incoterm(source: Any) -> Dict[str, Any]:
+    """Read DDP/EXW from text markers or nearby inline checkbox images."""
+    parsed = source if isinstance(source, ParsedPDF) else None
+    pages = parsed.pages[:5] if parsed else []
+    text = "\n".join(page.text for page in pages) if parsed else str(source or "")
     lines: List[Dict[str, str]] = []
     selected: List[str] = []
-    for raw_line in unicodedata.normalize("NFKC", page_text or "").splitlines():
-        line = _clean_inline(raw_line)
-        if "到货价" not in line and "出厂价" not in line:
-            continue
-        term = "DDP" if "到货价" in line else "EXW"
-        checked = any(marker in line for marker in CHECKED_MARKERS)
-        unchecked = any(marker in line for marker in UNCHECKED_MARKERS)
-        state = "checked" if checked and not unchecked else ("unchecked" if unchecked and not checked else "unknown")
-        lines.append({"term": term, "state": state, "text": line})
-        if state == "checked":
-            selected.append(term)
+
+    def visual_state(page: ParsedPage, keyword: str) -> str:
+        spans = [span for span in page.spans if keyword in _clean_inline(span.text)]
+        if not spans:
+            return "unknown"
+        span = spans[0]
+        sy = (span.bbox[1] + span.bbox[3]) / 2.0
+        candidates = []
+        for mark in getattr(page, "checkbox_marks", []) or []:
+            bbox = mark.get("bbox") or []
+            if len(bbox) != 4:
+                continue
+            mx = float(bbox[2])
+            my = (float(bbox[1]) + float(bbox[3])) / 2.0
+            if mx <= span.bbox[0] + 5 and abs(my - sy) <= 9:
+                candidates.append((abs(my - sy), float(span.bbox[0]) - mx, mark))
+        if not candidates:
+            return "unknown"
+        mark = min(candidates, key=lambda item: (item[0], item[1]))[2]
+        return "checked" if bool(mark.get("checked")) else "unchecked"
+
+    if parsed:
+        for page in pages:
+            for raw_line in unicodedata.normalize("NFKC", page.text or "").splitlines():
+                line = _clean_inline(raw_line)
+                if "到货价" not in line and "出厂价" not in line:
+                    continue
+                term = "DDP" if "到货价" in line else "EXW"
+                keyword = "到货价" if term == "DDP" else "出厂价"
+                state = visual_state(page, keyword)
+                if state == "unknown":
+                    checked = any(marker in line for marker in CHECKED_MARKERS)
+                    unchecked = any(marker in line for marker in UNCHECKED_MARKERS)
+                    state = "checked" if checked and not unchecked else ("unchecked" if unchecked and not checked else "unknown")
+                lines.append({"term": term, "state": state, "text": line})
+                if state == "checked":
+                    selected.append(term)
+    else:
+        for raw_line in unicodedata.normalize("NFKC", text).splitlines():
+            line = _clean_inline(raw_line)
+            if "到货价" not in line and "出厂价" not in line:
+                continue
+            term = "DDP" if "到货价" in line else "EXW"
+            checked = any(marker in line for marker in CHECKED_MARKERS)
+            unchecked = any(marker in line for marker in UNCHECKED_MARKERS)
+            state = "checked" if checked and not unchecked else ("unchecked" if unchecked and not checked else "unknown")
+            lines.append({"term": term, "state": state, "text": line})
+            if state == "checked":
+                selected.append(term)
     selected_terms = sorted(set(selected))
     return {
         "selected": selected_terms[0] if len(selected_terms) == 1 else "",
@@ -876,6 +989,7 @@ def _detect_contract_incoterm(page_text: str) -> Dict[str, Any]:
         "lines": lines,
         "candidates": sorted(set(item["term"] for item in lines)),
     }
+
 
 
 def _normalize_incoterm(value: str) -> str:
@@ -1115,6 +1229,58 @@ def _config_match(
 # ---------------------------------------------------------------------------
 
 
+# PM_EXTRACTION_HELPERS_PATCH_20260716
+def _extract_business_number(text: str) -> str:
+    compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", text or ""))
+    match = re.search(r"\b([MK]\d{4}-\d{4})\b", compact, re.I)
+    return match.group(1).upper() if match else ""
+
+
+def _multiline_label_value(text: str, label: str, max_lines: int = 4) -> str:
+    stop_labels = (
+        "报价编号", "报价单编号", "报价修订版本", "询价日期", "报价日期", "负责人",
+        "客户", "联络人", "联络地址", "地址 / 街道", "地址/街道", "邮政编码", "城市",
+        "国家或地区", "页码", "目录",
+    )
+    lines = (text or "").splitlines()
+    for index, raw_line in enumerate(lines):
+        clean = _clean_inline(raw_line)
+        pos = clean.find(label)
+        if pos < 0:
+            continue
+        first = clean[pos + len(label) :].lstrip(" :：")
+        parts = [first] if first else []
+        for following in lines[index + 1 : index + max_lines]:
+            value = _clean_inline(following)
+            if not value:
+                continue
+            if any(value.startswith(stop) or stop in value[:18] for stop in stop_labels):
+                break
+            if re.match(r"^\d+[./]\d+", value):
+                break
+            parts.append(value)
+        if parts:
+            return "".join(parts)
+    return ""
+
+
+def _clean_payment_verbatim(value: str) -> str:
+    lines = []
+    for raw in (value or "").replace("\r\n", "\n").replace("\r", "\n").splitlines():
+        line = raw.strip()
+        if not line:
+            if lines and lines[-1] != "":
+                lines.append("")
+            continue
+        if re.search(r"^(?:\d+\s*/\s*\d+|Doc\s+No\.|ABB\s+Robotics\s+China|Rev\s+No\.)", line, re.I):
+            continue
+        line = re.sub(r"[\uf000-\uf8ff]", "", line).strip()
+        if line:
+            lines.append(line)
+    while lines and lines[-1] == "":
+        lines.pop()
+    return "\n".join(lines)
+
 def extract_contract(parsed: Optional[ParsedPDF]) -> Dict[str, Any]:
     if parsed is None:
         return {}
@@ -1124,8 +1290,7 @@ def extract_contract(parsed: Optional[ParsedPDF]) -> Dict[str, Any]:
     transport_text = "\n".join(_normalize_extraction_text(page.text) for page in parsed.pages[:5])
     signature_text = "\n".join(_normalize_extraction_text(page.text) for page in parsed.pages[-3:])
 
-    contract_match = re.search(r"\b([MK])\s*(\d{4})\s*-\s*(\d{4})\b", text, re.I)
-    contract_number = "" if not contract_match else f"{contract_match.group(1).upper()}{contract_match.group(2)}-{contract_match.group(3)}"
+    contract_number = _extract_business_number(text)
     buyer = _match_first(first_pages, [r"买方[:：]\s*(.*?)\s*地址[:：]", r"甲方[（(]买方[）)][:：]\s*([^\n]+)"], re.S)
     seller = _match_first(first_pages, [r"卖方[:：]\s*(.*?)\s*地址[:：]", r"乙方[（(]卖方[）)][:：]\s*([^\n]+)"], re.S)
     buyer_address = _match_first(first_pages, [r"买方[:：].*?地址[:：]\s*(.*?)\s*卖方[:：]", r"买方地址[:：]\s*([^\n]+)"], re.S)
@@ -1195,7 +1360,7 @@ def extract_contract(parsed: Optional[ParsedPDF]) -> Dict[str, Any]:
         "delivery_page": int(contract_delivery.get("page", 0) or 0),
         "delivery_trigger": delivery_trigger,
         "split_delivery": bool(re.search(r"允许分批(?:装运|发货)", text)),
-        "incoterm_detection": _detect_contract_incoterm(transport_text),
+        "incoterm_detection": _detect_contract_incoterm(parsed),
         "untaxed_amount": untaxed_amount,
         "vat_rate": float(vat_text) / 100 if vat_text else 0.0,
         "tax_included_amount": tax_included_amount,
@@ -1226,7 +1391,12 @@ def extract_cqp(parsed: Optional[ParsedPDF]) -> Dict[str, Any]:
         return {}
     text = _normalize_extraction_text(parsed.full_text)
     products = _extract_cqp_products(parsed)
+    for product in products:
+        expected = round(float(product.get("qty", 0)) * float(product.get("unit_price", 0)), 2)
+        product["expected_line_total"] = expected
+        product["line_total_difference"] = round(float(product.get("line_total", 0)) - expected, 2)
     configs = _extract_configurations(parsed, "cqp")
+    warranty_details = _warranty_details_from_document(parsed, configs)
     number = re.search(r"(?:报价单编号|报价编号)[:：]?\s*(CQ\d{7})", text) or re.search(r"\b(CQ\d{7})\b", text)
     customer = _first_line_value(text, "客户") or _match_first(text, [r"客户(?:名称)?[:：]\s*([^\n]+)"])
     customer_address = _first_line_value(text, "联络地址") or _match_first(text, [r"客户地址[:：]\s*([^\n]+)"])
@@ -1243,21 +1413,23 @@ def extract_cqp(parsed: Optional[ParsedPDF]) -> Dict[str, Any]:
         gross = money_values[2]
     delivery_time = _match_first(text, [r"交货时间[:：]?\s*([^\n]+)", r"交期[:：]?\s*([^\n]+)"])
     delivery_term = _match_first(text, [r"交货条款[:：]?\s*([^\n]+)", r"贸易术语[:：]?\s*([^\n]+)"])
+    delivery_schedule = _extract_delivery_schedule(parsed)
     weeks = re.search(r"(\d+)\s*周", delivery_time)
     vat = re.search(r"增值税(?:率)?\s*[:：]?\s*(\d{1,2}(?:[.]\d+)?)\s*%", text)
     payment_terms = _extract_payment_terms(text)
     return {
         "cqp_number": number.group(1) if number else "",
         "version": _match_first(text, [r"报价修订版本[:：]?\s*([A-Za-z0-9._-]+)", r"版本号[:：]?\s*([A-Za-z0-9._-]+)"]),
-        "project_name": _clean_inline(_first_line_value(text, "项目名称") or _match_first(text, [r"项目名称[:：]?\s*([^\n]+)"])),
+        "project_name": _clean_inline(_multiline_label_value(text, "项目名称") or _first_line_value(text, "项目名称") or _match_first(text, [r"项目名称[:：]?\s*([^\n]+)"])),
         "customer_name": _clean_inline(customer),
         "customer_address": _clean_inline(customer_address),
+        "customer_postal_code": _clean_inline(_first_line_value(text, "邮政编码")),
         "end_user": _clean_entity(_match_first(text, [r"(?:最终用户|终端客户)(?:名称)?[:：]\s*([^\n]+)"])),
         "end_user_address": _clean_entity(_match_first(text, [r"(?:最终用户|终端客户)地址[:：]\s*([^\n]+)"])),
         "ship_to_name": _clean_entity(_match_first(text, [r"(?:Ship[- ]?to|收货方)(?:名称)?[:：]\s*([^\n]+)"])),
         "ship_to_address": _clean_entity(_match_first(text, [r"(?:Ship[- ]?to|收货方)地址[:：]\s*([^\n]+)"])),
         "seller_name": _clean_entity(seller),
-        "sales_person": _clean_inline(_match_first(text, [r"(?:负责人|销售人员|Sales)[:：]\s*([^\n]+)"])),
+        "sales_person": _clean_inline(_match_first(text, [r"(?:负责人|销售人员|Sales)\s*[:：]?\s*([^\n]+)"])),
         "products": products,
         "total_qty": sum(int(product.get("qty", 0)) for product in products),
         "untaxed_total": untaxed,
@@ -1267,53 +1439,91 @@ def extract_cqp(parsed: Optional[ParsedPDF]) -> Dict[str, Any]:
         "payment_terms": payment_terms,
         "delivery_time": _clean_inline(delivery_time),
         "delivery_weeks": int(weeks.group(1)) if weeks else 0,
+        "delivery_schedule": delivery_schedule,
         "delivery_trigger": "预付款到账" if "预付款" in delivery_time else ("合同生效" if "合同生效" in delivery_time else ""),
         "delivery_term": _clean_inline(delivery_term),
         "warranty_terms": _clean_inline(_match_first(text, [r"质量保证[:：]?\s*([^\n]+)", r"质保[:：]?\s*([^\n]+)"])),
         "configurations": configs,
-        "warranty_codes_by_model": _extract_warranty_codes_by_model(configs),
-        "warranty_details_by_model": _warranty_config_details(configs),
-        "extraction_state": {
-            "products": "EXTRACTED" if products else "EXTRACTION_FAILED",
-            "configurations": "EXTRACTED" if configs else "EXTRACTION_FAILED",
-            "payment_terms": payment_terms.get("extraction_state", "EXTRACTION_FAILED"),
-        },
+        "warranty_codes_by_model": {model: data.get("code", "") for model, data in warranty_details.items() if data.get("code")},
+        "warranty_details_by_model": warranty_details,
+        "extraction_state": {"products": "EXTRACTED" if products else "EXTRACTION_FAILED", "configurations": "EXTRACTED" if configs else "EXTRACTION_FAILED", "payment_terms": payment_terms.get("extraction_state", "EXTRACTION_FAILED")},
     }
 
+
+
+# PM_TA_RED_FLAGS_PATCH_20260716
+def _extract_ta_technical_red_flags(parsed: Optional[ParsedPDF]) -> List[Dict[str, Any]]:
+    issues: List[Dict[str, Any]] = []
+    if parsed is None:
+        return issues
+    for page in parsed.pages:
+        text = _normalize_extraction_text(page.text)
+        for match in re.finditer(r"位置重复精度\s*[:：]\s*([0-9]+(?:[.]\d+)?)\s*(mm|m)\b", text, re.I):
+            value, unit = float(match.group(1)), match.group(2).lower()
+            if unit == "m" and value < 0.1:
+                issues.append({"type": "repeatability_unit", "page": page.page_num, "quote": _clean_inline(match.group(0)), "detail": f"位置重复精度写为{value:g}m（等于{value * 1000:g}mm），单位高度可疑，必须由技术人员确认。"})
+        # Normalize one physical line at a time. Whole-page normalization turns
+        # the newline after a trailing colon into a space, which would make the
+        # next numbered heading look like the SafeMove field value.
+        lines = [
+            _clean_inline(_normalize_extraction_text(line))
+            for line in (page.text or "").splitlines()
+            if _clean_inline(_normalize_extraction_text(line))
+        ]
+        for index, line in enumerate(lines):
+            match = re.search(r"Safe\s*move\s*功能\s*[:：]\s*(.*)$", line, re.I)
+            if not match:
+                continue
+            value = match.group(1).strip(" _-—")
+            next_line = lines[index + 1] if index + 1 < len(lines) else ""
+            numbered_heading = bool(
+                re.match(r"^\d+(?:[.]\d+)*(?:[.、）)]|\s)", next_line)
+            )
+            if not value and (not next_line or numbered_heading):
+                issues.append({"type": "blank_safemove", "page": page.page_num, "quote": line, "detail": "TA中的SafeMove功能字段为空，但配置清单存在SafeMove相关项，需补全或确认。"})
+    unique = []
+    seen = set()
+    for issue in issues:
+        key = (issue["type"], issue["page"], issue["quote"])
+        if key not in seen:
+            unique.append(issue)
+            seen.add(key)
+    return unique
 
 def extract_ta(parsed: Optional[ParsedPDF]) -> Dict[str, Any]:
     if parsed is None:
         return {}
     text = _normalize_extraction_text(parsed.full_text)
     configs = _extract_configurations(parsed, "ta")
-    quantities = _extract_model_quantities(parsed)
-    contract_match = re.search(r"合同编号[:：]?\s*([MK]\s*\d{4}\s*-\s*\d{4})", text, re.I)
+    quantity_details = _extract_model_quantity_details(parsed)
+    quantities = quantity_details["selected"]
     compact_text = re.sub(r"\s+", "", text)
     placeholders = {"@@@Chop_ABB", "@@@Chop_Customer", "@@@Sign_ABBPerson", "@@@Sign_CustomerPerson"}
+    warranty_details = _warranty_details_from_document(parsed, configs)
+    quotation_number = _match_first(text, [r"Quotation\s*No[.]?\s*[:：]\s*([^\n]+)", r"报价编号\s*[:：]\s*(CQ\d{7})"])
+    quotation_blank = bool(re.search(r"Quotation\s*No[.]?\s*[:：]\s*(?:\n|$)", text, re.I)) and not quotation_number
     return {
-        "contract_number": re.sub(r"\s+", "", contract_match.group(1)).upper() if contract_match else "",
+        "contract_number": _extract_business_number(text),
+        "quotation_number": _clean_inline(quotation_number),
+        "quotation_number_blank": quotation_blank,
         "buyer_name": _clean_entity(_match_first(text, [r"甲方[（(]买方[）)][:：]\s*([^\n]+)", r"买方[:：]\s*([^\n]+)"])),
         "buyer_address": _clean_entity(_match_first(text, [r"买方地址[:：]\s*([^\n]+)"])),
         "seller_name": _clean_entity(_match_first(text, [r"卖方[（(]乙方[）)][:：]\s*([^\n]+)", r"乙方[（(]卖方[）)][:：]\s*([^\n]+)"])),
         "products": [{"model": model, "qty": qty} for model, qty in quantities.items()],
         "total_qty": sum(quantities.values()),
+        "quantity_conflicts": quantity_details.get("conflicts", []),
         "configurations": configs,
-        "warranty_codes_by_model": _extract_warranty_codes_by_model(configs),
-        "warranty_details_by_model": _warranty_config_details(configs),
+        "warranty_codes_by_model": {model: data.get("code", "") for model, data in warranty_details.items() if data.get("code")},
+        "warranty_details_by_model": warranty_details,
+        "technical_red_flags": _extract_ta_technical_red_flags(parsed),
         "lps_name_in_supply": "LPS" if re.search(r"IRB\s*\d{3,4}[^\n]{0,40}\bLPS\b", text, re.I) else "",
         "lps_name_in_parameters": "Lite+" if re.search(r"IRB\s*\d{3,4}[^\n]{0,40}Lite\s*[+＋]", text, re.I) else "",
         "signature_placeholders": sorted(token for token in placeholders if token in compact_text),
         "blank_signature_dates": bool(re.search(r"日期[:：]\s+日期[:：]", text) or re.search(r"日期[:：]\s*(?:\n|$)", text)),
-        "responsibilities": {
-            "buyer_integration": bool(re.search(r"买方.*?负责.*?系统集成", text, re.S)),
-            "buyer_installation": bool(re.search(r"买方.*?负责.*?(?:卸货|起吊|就位|现场安装)", text, re.S)),
-            "seller_not_integration": bool(re.search(r"卖方.*?不承担.*?系统集成", text, re.S)),
-        },
-        "extraction_state": {
-            "products": "EXTRACTED" if quantities else "EXTRACTION_FAILED",
-            "configurations": "EXTRACTED" if configs else "EXTRACTION_FAILED",
-        },
+        "responsibilities": {"buyer_integration": bool(re.search(r"买方.*?负责.*?系统集成", text, re.S)), "buyer_installation": bool(re.search(r"买方.*?负责.*?(?:卸货|起吊|就位|现场安装)", text, re.S)), "seller_not_integration": bool(re.search(r"卖方.*?不承担.*?系统集成", text, re.S))},
+        "extraction_state": {"products": "EXTRACTED" if quantities else "EXTRACTION_FAILED", "configurations": "EXTRACTED" if configs else "EXTRACTION_FAILED"},
     }
+
 
 # ---------------------------------------------------------------------------
 # Evidence and review item construction
@@ -2132,3 +2342,139 @@ __all__ = [
     "_amount_status", "_canonical_model", "_extract_configurations", "_extract_cqp_products", "_extract_model_quantities", "_extract_payment_terms", "_extract_warranty_clause",
     "_find_ta_start", "_infer_incoterm", "_match_customer_master",
 ]
+
+# PM_CONTRACT_REVIEW_PATCH_20260716_V1
+_ORIGINAL_BUILD_REVIEW_ITEMS_20260716 = build_review_items
+_ORIGINAL_BUILD_BT09_DRAFT_20260716 = _build_bt09_draft
+_ORIGINAL_RUN_REVIEW_20260716 = run_review
+
+
+def _replace_review_item(items: List[Dict[str, Any]], replacement: Dict[str, Any]) -> None:
+    for index, item in enumerate(items):
+        if item.get("id") == replacement.get("id"):
+            items[index] = replacement
+            return
+    items.append(replacement)
+
+
+def _delivery_review_item_20260716(documents: DocumentSet, contract: Dict[str, Any], cqp: Dict[str, Any]) -> Dict[str, Any]:
+    contract_map = {str(item.get("model", "")): int(item.get("weeks", 0) or 0) for item in contract.get("delivery_schedule", []) if item.get("model")}
+    cqp_map = {str(item.get("model", "")): int(item.get("weeks", 0) or 0) for item in cqp.get("delivery_schedule", []) if item.get("model")}
+    global_weeks = int(cqp.get("delivery_weeks", 0) or 0)
+    models = sorted(set(contract_map) | set(cqp_map))
+    sub_items = []
+    mismatches = []
+    missing = []
+    for model in models:
+        left = contract_map.get(model, 0)
+        right = cqp_map.get(model, 0) or global_weeks
+        if not left or not right:
+            status, state = "UNDETERMINED", "EXTRACTION_FAILED"
+            summary = f"合同 {left or '未提取'}周 / CQP {right or '未提取'}周。"
+            missing.append(model)
+        elif left != right:
+            status, state = "MISMATCH", "MISMATCH"
+            summary = f"合同 {left}周 / CQP {right}周，逐型号交期明确不一致。"
+            mismatches.append(f"{model}: {left}周 vs {right}周")
+        else:
+            status, state = "PASS", "MATCH"
+            summary = f"合同与CQP均为{left}周。"
+        sub_items.append({"id": "delivery_" + re.sub(r"[^a-z0-9]+", "_", model.lower()).strip("_"), "title": model, "status": status, "decision_state": state, "summary": summary, "values": {"合同": left or "未提取", "CQP": right or "未提取"}, "evidence": []})
+    trigger_diff = bool(contract.get("delivery_trigger") and cqp.get("delivery_trigger") and contract.get("delivery_trigger") != cqp.get("delivery_trigger"))
+    if mismatches:
+        # Project policy keeps delivery differences non-blocking because BT09
+        # always copies the contract schedule. Preserve per-model mismatches as
+        # explicit evidence, but expose the aggregate item as a review warning.
+        status, severity, summary = "WARNING", "warning", "合同与CQP存在逐型号交期差异（非阻塞，BT09以合同为准）：" + "；".join(mismatches)
+    elif missing:
+        status, severity, summary = "UNDETERMINED", "warning", "部分逐型号交期未提取：" + "、".join(missing)
+    elif trigger_diff:
+        status, severity, summary = "WARNING", "warning", "逐型号周数一致，但合同与CQP的交期起算条件不同；BT09以合同原文为准。"
+    else:
+        status, severity, summary = "PASS", "info", "合同与CQP逐型号交期及起算条件一致。"
+    return _item(
+        "delivery_period", CATEGORY_OTHER, "交付周期与起算条件", status, severity, summary,
+        {"合同": "；".join(f"{model} {weeks}周" for model, weeks in contract_map.items()) or "未提取", "合同起算": contract.get("delivery_trigger") or "未提取", "CQP逐型号": "；".join(f"{model} {weeks}周" for model, weeks in cqp_map.items()) or "未提取", "CQP通用": cqp.get("delivery_time") or "未提取", "CQP起算": cqp.get("delivery_trigger") or "未提取", "差异": mismatches or "无", "BT09来源": "合同"},
+        [], sub_items,
+        decision_state="REVIEW_REQUIRED" if mismatches else ("EXTRACTION_FAILED" if missing else ("REVIEW_REQUIRED" if trigger_diff else "MATCH")),
+    )
+
+
+def build_review_items(documents: DocumentSet, contract: Dict[str, Any], cqp: Dict[str, Any], ta: Dict[str, Any]) -> List[Dict[str, Any]]:
+    items = _ORIGINAL_BUILD_REVIEW_ITEMS_20260716(documents, contract, cqp, ta)
+    by_id = {item.get("id"): item for item in items}
+
+    seller = by_id.get("seller_entity")
+    if seller and seller.get("status") == "PASS" and seller.get("values", {}).get("合同号预期实体") == "无映射":
+        seller["summary"] = "三份文件卖方主体一致；当前合同号前缀无映射，因此未声称完成前缀规则校验。"
+
+    lps = by_id.get("lps_lite_naming")
+    has_lps = any("LPS" in str(item.get("model", "")).upper() for item in ta.get("products", []))
+    if lps and not has_lps:
+        lps.update({"status": "INFO", "severity": "info", "decision_state": "NOT_APPLICABLE", "summary": "本合同不包含LPS/Lite+型号，本检查不适用。"})
+
+    _replace_review_item(items, _delivery_review_item_20260716(documents, contract, cqp))
+
+    conflicts = ta.get("quantity_conflicts", [])
+    conflict_text = [f"{entry.get('model')}: {entry.get('values')}" for entry in conflicts]
+    _replace_review_item(items, _item(
+        "ta_internal_quantity_consistency", CATEGORY_PRODUCT, "TA内部数量一致性",
+        "MISMATCH" if conflicts else "PASS", "blocker" if conflicts else "info",
+        "TA同一型号出现互相矛盾的明确数量：" + "；".join(conflict_text) if conflicts else "TA未发现同一型号的明确数量自相矛盾。",
+        {"冲突": conflict_text or "无", "采用数量": {entry.get("model"): entry.get("selected") for entry in conflicts}},
+        [], decision_state="MISMATCH" if conflicts else "MATCH",
+    ))
+
+    red_flags = ta.get("technical_red_flags", [])
+    _replace_review_item(items, _item(
+        "ta_technical_red_flags", CATEGORY_PRODUCT, "TA显性技术参数风险",
+        "MISMATCH" if red_flags else "PASS", "blocker" if red_flags else "info",
+        "；".join(str(entry.get("detail", "")) for entry in red_flags) if red_flags else "未发现预设的显性技术参数风险。",
+        {"问题": [entry.get("detail") for entry in red_flags] or "无"},
+        [_evidence(documents.ta, "ta", entry.get("type", "技术参数"), [entry.get("quote", "")], page_hint=entry.get("page")) for entry in red_flags],
+        decision_state="MISMATCH" if red_flags else "MATCH",
+    ))
+
+    arithmetic = []
+    for product in cqp.get("products", []):
+        diff = round(float(product.get("line_total_difference", 0) or 0), 2)
+        if abs(diff) >= 0.005:
+            arithmetic.append(f"{product.get('model')}: 数量×单价={product.get('expected_line_total'):.2f}，行总额={float(product.get('line_total', 0)):.2f}，差额={diff:.2f}")
+    _replace_review_item(items, _item(
+        "cqp_line_arithmetic", CATEGORY_OTHER, "CQP行金额算术校验",
+        "WARNING" if arithmetic else "PASS", "warning" if arithmetic else "info",
+        "；".join(arithmetic) if arithmetic else "CQP各产品行的数量×单价与行总额一致。",
+        {"差异": arithmetic or "无"}, [], decision_state="REVIEW_REQUIRED" if arithmetic else "MATCH",
+    ))
+
+    completeness = []
+    if str(cqp.get("customer_postal_code", "")).strip() == "000000":
+        completeness.append("CQP客户邮政编码为占位值000000")
+    if ta.get("quotation_number_blank"):
+        completeness.append("TA页眉Quotation No.为空")
+    _replace_review_item(items, _item(
+        "document_field_completeness", CATEGORY_OTHER, "模板字段完整性",
+        "WARNING" if completeness else "PASS", "warning" if completeness else "info",
+        "；".join(completeness) if completeness else "未发现预设的模板占位字段问题。",
+        {"问题": completeness or "无"}, [], decision_state="REVIEW_REQUIRED" if completeness else "MATCH",
+    ))
+    return items
+
+
+def _build_bt09_draft(contract: Dict[str, Any], cqp: Dict[str, Any], ta: Dict[str, Any], items: Sequence[Dict[str, Any]], customer_master: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    fields = _ORIGINAL_BUILD_BT09_DRAFT_20260716(contract, cqp, ta, items, customer_master)
+    fields["payment_terms_verbatim"] = _clean_payment_verbatim(contract.get("payment_terms", {}).get("raw", ""))
+    fields["draft_mode"] = "ready" if fields.get("ready") else "preview_only"
+    return fields
+
+
+def run_review(pdf_paths: List[str], customer_db_path: str = None, template_path: str = None, file_roles: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    result = _ORIGINAL_RUN_REVIEW_20260716(pdf_paths, customer_db_path=customer_db_path, template_path=template_path, file_roles=file_roles)
+    preview = result.get("bt09_draft", "")
+    ready = bool(result.get("bt09_fields", {}).get("ready"))
+    result["bt09_preview"] = preview
+    result["bt09_draft"] = preview if ready else ""
+    result["pipeline_completed"] = True
+    result["review_passed"] = result.get("conclusion") == "Pass"
+    result["review_blocked"] = result.get("conclusion") == "Blocked"
+    return result

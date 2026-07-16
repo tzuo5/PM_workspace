@@ -49,7 +49,7 @@ _FALLBACK_ALIASES: Dict[str, Tuple[str, ...]] = {
 # Codes known to be commercial metadata rather than TA technical scope.  This is
 # intentionally narrow: packages such as 3120-2 and 3151-1 may be technical and
 # must not be silently ignored merely because their name contains "package".
-_DEFAULT_COMMERCIAL_ONLY_CODES: Set[str] = {"448-125"}
+_DEFAULT_COMMERCIAL_ONLY_CODES: Set[str] = {"448-125", "3144-1", "3112-1", "3371-27"}
 
 _TERM_ALIASES: Tuple[Tuple[str, str], ...] = (
     ("flexpendant", "示教器"),
@@ -105,6 +105,27 @@ def _read_text(path: str) -> str:
     return ""
 
 
+def _exclusive_family_from_heading(value: str) -> str:
+    """Return only mutually-exclusive option families.
+
+    Broad sections such as “功能项” contain independent features and must never
+    cause 3151-1 Program Package to conflict with 3107-1 Collision Detection.
+    """
+    key = _normalize_text(re.sub(r"^\d+(?:[.]\d+)*\s*", "", value or ""))
+    for token, family in (
+        ("颜色", "颜色"),
+        ("防护等级", "防护等级"),
+        ("控制器", "控制器"),
+        ("示教器", "示教器"),
+        ("本体电缆", "本体电缆"),
+        ("io", "I/O"),
+        ("质保", "质保"),
+    ):
+        if token in key:
+            return family
+    return ""
+
+
 def _parse_mapping_markdown(text: str) -> Tuple[Dict[str, Set[str]], Dict[str, str]]:
     aliases: Dict[str, Set[str]] = {}
     families: Dict[str, str] = {}
@@ -114,7 +135,7 @@ def _parse_mapping_markdown(text: str) -> Tuple[Dict[str, Set[str]], Dict[str, s
         line = raw_line.strip()
         heading = re.match(r"^#{2,6}\s+(.*)$", line)
         if heading:
-            current_family = re.sub(r"^\d+(?:[.]\d+)*\s*", "", heading.group(1)).strip()
+            current_family = _exclusive_family_from_heading(heading.group(1))
             continue
         if not line.startswith("|"):
             continue
@@ -131,6 +152,7 @@ def _parse_mapping_markdown(text: str) -> Tuple[Dict[str, Set[str]], Dict[str, s
         if current_family:
             families[code] = current_family
     return aliases, families
+
 
 
 def _knowledge_directory() -> str:

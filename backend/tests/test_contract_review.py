@@ -97,7 +97,7 @@ class EvidenceFirstRegressionTests(unittest.TestCase):
         )
         self.assertEqual(_extract_model_quantities(parsed), {})
 
-    def test_configuration_parser_rejects_dates_voltage_and_cross_page_carryover(self) -> None:
+    def test_configuration_parser_rejects_noise_and_keeps_cross_page_continuation(self) -> None:
         parsed = ParsedPDF(
             "ta.pdf",
             [
@@ -106,7 +106,10 @@ class EvidenceFirstRegressionTests(unittest.TestCase):
             ],
         )
         configs = _extract_configurations(parsed, "ta")
-        self.assertEqual([(item["model"], item["code"]) for item in configs], [("IRB 2600-20/1.65", "3000-1")])
+        self.assertEqual(
+            [(item["model"], item["code"]) for item in configs],
+            [("IRB 2600-20/1.65", "3000-1"), ("IRB 2600-20/1.65", "3016-3")],
+        )
 
     def test_template_underscores_do_not_break_money_vat_or_delivery(self) -> None:
         parsed = ParsedPDF(

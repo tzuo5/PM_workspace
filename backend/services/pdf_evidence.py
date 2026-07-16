@@ -27,6 +27,7 @@ class TextSpan:
 
 
 @dataclass
+@dataclass
 class ParsedPage:
     page_num: int
     width: float
@@ -34,6 +35,10 @@ class ParsedPage:
     text: str
     spans: List[TextSpan] = field(default_factory=list)
     tables: List[Any] = field(default_factory=list)
+    # Small inline checkbox images detected by PyMuPDF. Each entry contains
+    # bbox=[x0,y0,x1,y1], checked=bool, and darkness_ratio=float.
+    checkbox_marks: List[Dict[str, Any]] = field(default_factory=list)
+
 
 
 @dataclass
@@ -43,8 +48,58 @@ class ParsedPDF:
     full_text: str = ""
 
 
+def _extract_checkbox_marks_fitz(doc: Any, page: Any) -> List[Dict[str, Any]]:
+    """Detect tiny checked/unchecked bitmap boxes without OCR.
+
+    ABB templates store checkbox glyphs as 19x19 inline images. The border of an
+    unchecked box is dark, so classification uses only the inner image area.
+    """
+    marks: List[Dict[str, Any]] = []
+    seen = set()
+    try:
+        import fitz
+
+        for image in page.get_images(full=True) or []:
+            xref = int(image[0])
+            if xref in seen:
+                continue
+            seen.add(xref)
+            pix = fitz.Pixmap(doc, xref)
+            if pix.alpha or pix.n < 3:
+                pix = fitz.Pixmap(fitz.csRGB, pix)
+            if not (8 <= pix.width <= 64 and 8 <= pix.height <= 64 and pix.n >= 3):
+                continue
+            samples = bytes(pix.samples)
+            margin_x = max(2, pix.width // 6)
+            margin_y = max(2, pix.height // 6)
+            dark = 0
+            total = 0
+            for y in range(margin_y, pix.height - margin_y):
+                for x in range(margin_x, pix.width - margin_x):
+                    offset = (y * pix.width + x) * pix.n
+                    rgb = samples[offset : offset + 3]
+                    if len(rgb) < 3:
+                        continue
+                    total += 1
+                    if sum(rgb) / 3.0 < 180:
+                        dark += 1
+            ratio = dark / total if total else 0.0
+            checked = ratio >= 0.03
+            for rect in page.get_image_rects(xref) or []:
+                if not (5 <= rect.width <= 24 and 5 <= rect.height <= 24):
+                    continue
+                marks.append({
+                    "bbox": [float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)],
+                    "checked": checked,
+                    "darkness_ratio": round(ratio, 4),
+                })
+    except Exception:
+        return []
+    return marks
+
+
 def parse_pdf_with_evidence(filepath: str) -> ParsedPDF:
-    """Read a PDF and extract text plus word coordinates without mutating it."""
+    """Read a PDF and extract text, coordinates, tables, and checkbox state."""
     try:
         import fitz  # PyMuPDF
 
@@ -78,6 +133,7 @@ def parse_pdf_with_evidence(filepath: str) -> ParsedPDF:
                         text=page.get_text("text", sort=True) or "",
                         spans=spans,
                         tables=tables,
+                        checkbox_marks=_extract_checkbox_marks_fitz(doc, page),
                     )
                 )
         result = ParsedPDF(filepath=filepath, pages=pages, full_text="\n".join(p.text for p in pages))
@@ -87,6 +143,7 @@ def parse_pdf_with_evidence(filepath: str) -> ParsedPDF:
         pass
 
     return _parse_with_pdfplumber(filepath)
+
 
 
 # CONTRACT_REVIEW_M4367_PATCH_V3: selective-ocr

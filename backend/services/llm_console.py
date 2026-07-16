@@ -59,21 +59,25 @@ def _print_error(request_id: str, error: BaseException, elapsed_seconds: float) 
 
 
 def logged_llm_call(
-    call: Callable[[Dict[str, Any], List[Dict[str, str]]], str],
+    call: Callable[..., Any],
     config: Dict[str, Any],
     messages: List[Dict[str, str]],
-) -> str:
-    """Run one LLM call and print its complete prompt and response."""
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Run one LLM call, forwarding optional API kwargs and logging content."""
     request_id = uuid.uuid4().hex[:8]
     started = time.perf_counter()
     _print_request(request_id, config, messages)
     try:
-        response = call(config, messages)
+        response = call(config, messages, *args, **kwargs)
     except BaseException as exc:
         _print_error(request_id, exc, time.perf_counter() - started)
         raise
-    _print_response(request_id, response, time.perf_counter() - started)
+    printable = response.get("content", "") if isinstance(response, dict) else response
+    _print_response(request_id, _text(printable), time.perf_counter() - started)
     return response
+
 
 
 def install_contract_review_console() -> None:
@@ -84,9 +88,15 @@ def install_contract_review_console() -> None:
     if getattr(current, "_pm_llm_console_wrapped", False):
         return
 
-    def wrapped(config: Dict[str, Any], messages: List[Dict[str, str]]) -> str:
-        return logged_llm_call(current, config, messages)
+    def wrapped(
+        config: Dict[str, Any],
+        messages: List[Dict[str, str]],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        return logged_llm_call(current, config, messages, *args, **kwargs)
 
     wrapped._pm_llm_console_wrapped = True  # type: ignore[attr-defined]
     wrapped._pm_llm_console_original = current  # type: ignore[attr-defined]
     contract_llm_review.call_llm_chat = wrapped
+
